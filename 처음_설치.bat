@@ -115,6 +115,46 @@ echo [설정] 동시 번역 처리량 설정을 적용합니다...
 setx OLLAMA_NUM_PARALLEL "4" >nul
 setx OLLAMA_CONTEXT_LENGTH "4096" >nul
 
+if exist "쯔꾸르_한국어화_도구.exe" goto exe_ready
+
+echo.
+echo [빌드] 실행 파일이 없어 소스에서 새로 빌드합니다...
+where python >nul 2>nul
+if errorlevel 1 goto need_python
+
+echo [빌드] 필요한 패키지를 설치합니다 (처음 한 번만, 몇 분 걸릴 수 있습니다)...
+python -m pip install --user --quiet pyinstaller customtkinter fonttools brotli requests
+if errorlevel 1 goto pip_failed
+
+pushd src
+pyinstaller --noconfirm --onefile --windowed --name "쯔꾸르_한국어화_도구" --collect-all customtkinter --add-data "plugins;plugins" --distpath .. gui.py
+if errorlevel 1 goto build_failed
+popd
+echo [빌드] 완료.
+goto exe_ready
+
+:need_python
+echo.
+echo [오류] Python이 설치되어 있지 않아 실행 파일을 빌드할 수 없습니다.
+echo https://python.org 에서 Python 3.10 이상을 설치할 때 "Add python.exe to PATH"를
+echo 꼭 체크한 뒤, 이 스크립트를 다시 실행해주세요.
+pause
+exit /b 1
+
+:pip_failed
+echo.
+echo [오류] 필요한 패키지 설치에 실패했습니다. 인터넷 연결을 확인 후 다시 시도해주세요.
+pause
+exit /b 1
+
+:build_failed
+popd
+echo.
+echo [오류] 빌드에 실패했습니다. 위 오류 메시지를 확인해주세요.
+pause
+exit /b 1
+
+:exe_ready
 echo.
 echo ================================================
 echo  설치 완료!
