@@ -168,6 +168,7 @@ class LocalizerGUI:
         self.result_model: str | None = None
         self.result_cache_path: str | None = None
         root.after(100, self._poll_queue)
+        root.protocol("WM_DELETE_WINDOW", self._on_close)
 
     @staticmethod
     def _bg_hex(widget) -> str:
@@ -267,6 +268,53 @@ class LocalizerGUI:
                           f"(남은 시도: {attempts_left})")
         ollama_ctl.stop()
         self.root.after(1000, lambda: self._confirm_ollama_stopped_then_close(attempts_left - 1))
+
+    def _on_close(self):
+        """Handles the window being closed manually (X button, taskbar ->
+        close). If Ollama isn't running there's nothing to ask about; if it
+        is, confirm before killing a process the user may still want
+        running for something else."""
+        if self.worker and self.worker.is_alive():
+            if not messagebox.askyesno(
+                "번역 진행 중",
+                "지금 번역이 돌고 있어요. 종료하면 번역이 중단됩니다.\n그래도 종료할까요?",
+            ):
+                return
+        if not ollama_ctl.is_running():
+            self.root.destroy()
+            return
+        if not messagebox.askyesno(
+            "종료 확인",
+            "Ollama가 작동 중입니다. Ollama도 함께 종료하시겠습니까?",
+        ):
+            self.root.destroy()
+            return
+        self._show_ollama_shutdown_dialog()
+
+    def _show_ollama_shutdown_dialog(self):
+        dlg = ctk.CTkToplevel(self.root)
+        dlg.title("종료 중")
+        dlg.geometry("320x110")
+        dlg.resizable(False, False)
+        dlg.protocol("WM_DELETE_WINDOW", lambda: None)  # block closing mid-shutdown
+        dlg.grab_set()
+        status_var = tk.StringVar(value="Ollama 종료중...")
+        ctk.CTkLabel(dlg, textvariable=status_var, font=("", 14), wraplength=280).pack(
+            expand=True, padx=20, pady=20)
+        ollama_ctl.stop()
+        self.root.after(1000, lambda: self._poll_ollama_shutdown_dialog(status_var, 8))
+
+    def _poll_ollama_shutdown_dialog(self, status_var: tk.StringVar, attempts_left: int):
+        if not ollama_ctl.is_running():
+            status_var.set("Ollama가 종료되었습니다.")
+            self.root.after(1200, self.root.destroy)
+            return
+        if attempts_left <= 0:
+            status_var.set("Ollama 종료에 실패했습니다. 직접 확인해주세요.")
+            self.root.after(2000, self.root.destroy)
+            return
+        ollama_ctl.stop()
+        self.root.after(1000, lambda: self._poll_ollama_shutdown_dialog(status_var, attempts_left - 1))
 
     def _toggle_ollama(self):
         if self.worker and self.worker.is_alive():
