@@ -1,0 +1,20 @@
+# Translated game output / cache -- these contain copyrighted game content
+# and must never be committed.
+*_KO/
+*_translations.json
+_translation_review.json
+
+# Python build artifacts
+src/build/
+src/dist/
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Leftover PyInstaller onefile temp extraction folders (see the "Failed to
+# remove temporary directory" warning after a force-killed run)
+_MEI*/
+
+# Built executable -- rebuild from source (see README) or attach as a
+# GitHub Release asset instead of committing a 30+ MB binary.
+*.exe

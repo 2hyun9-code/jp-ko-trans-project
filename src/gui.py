@@ -1,0 +1,768 @@
+"""Desktop GUI for the RPG Maker MV/MZ -> Korean localizer.
+
+Wraps pipeline.run_all() in a background thread so the window stays
+responsive, and streams its log/progress into the window via a queue.
+Built with CustomTkinter for a modern look (Fluent-style, light/dark mode)
+instead of stock ttk widgets.
+"""
+from __future__ import annotations
+
+import json
+import os
+import queue
+import shutil
+import subprocess
+import sys
+import threading
+import time
+import tkinter as tk
+from pathlib import Path
+from tkinter import filedialog, messagebox
+
+import customtkinter as ctk
+
+import notify
+import ollama_ctl
+import power
+from engine import detect_project
+from pipeline import REVIEW_FILENAME, run_all
+from render_patch import build_translation_map, inject_render_patch
+from textwalk import collect_glossary_names, walk_project
+from translator import OllamaTranslator
+
+ctk.set_appearance_mode("System")
+ctk.set_default_color_theme("blue")
+
+DEFAULT_FONT_CANDIDATES = [
+    r"C:\Windows\Fonts\malgun.ttf",
+    r"C:\Windows\Fonts\malgunbd.ttf",
+]
+
+FALLBACK_MODELS = [
+    "hf.co/hell0ks/ja-ko-vn-12b-v2-gguf:Q5_K_M",
+    "kaelri/hy-mt2:7b",
+    "qwen2.5:14b-instruct",
+    "qwen2.5:7b-instruct",
+    "aya-expanse:8b",
+    "gemma2:27b",
+]
+
+WORKER_CHOICES = [str(n) for n in range(1, 17)]
+
+
+def list_ollama_models() -> list[str]:
+    """Queries the HTTP API (not the `ollama` CLI) so this never has the
+    side effect of auto-starting the Ollama app when it's stopped -- the
+    CLI does that automatically on Windows, the HTTP API does not."""
+    if not ollama_ctl.is_running():
+        return FALLBACK_MODELS
+    try:
+        import requests
+        r = requests.get(f"{ollama_ctl.OLLAMA_BASE}/api/tags", timeout=3)
+        r.raise_for_status()
+        models = [m["name"] for m in r.json().get("models", [])]
+        return models or FALLBACK_MODELS
+    except Exception:
+        return FALLBACK_MODELS
+
+
+class LocalizerGUI:
+    def __init__(self, root: ctk.CTk):
+        self.root = root
+        root.title("쯔꾸르 게임 한국어화 도구")
+        root.geometry("760x600")
+        root.minsize(680, 500)
+
+        self.q: "queue.Queue[tuple[str, object]]" = queue.Queue()
+        self.worker: threading.Thread | None = None
+        self.cancel_flag = False
+
+        pad = {"padx": 10, "pady": 6}
+
+        frm = ctk.CTkFrame(root, fg_color="transparent")
+        frm.pack(fill="x", **pad)
+        frm.columnconfigure(1, weight=1)
+
+        self.game_var = tk.StringVar()
+        self.out_var = tk.StringVar()
+        self.font_var = tk.StringVar(value=self._default_font())
+        self.model_var = tk.StringVar(value="hf.co/hell0ks/ja-ko-vn-12b-v2-gguf:Q5_K_M")
+        self.workers_var = tk.StringVar(value="6")
+
+        self._row(frm, 0, "원본 게임 폴더", self.game_var, self._browse_game)
+        self._row(frm, 1, "출력 폴더 (새로 생성됨)", self.out_var, self._browse_out)
+        self._row(frm, 2, "한국어 폰트 (.ttf)", self.font_var, self._browse_font)
+
+        ctk.CTkLabel(frm, text="번역 모델").grid(row=3, column=0, sticky="w", padx=10, pady=6)
+        self.model_combo = ctk.CTkComboBox(frm, variable=self.model_var, values=FALLBACK_MODELS,
+                                            width=360)
+        self.model_combo.grid(row=3, column=1, sticky="we", padx=10, pady=6)
+        self.download_model_btn = ctk.CTkButton(frm, text="모델 다운로드", width=110,
+                                                  command=self._download_model)
+        self.download_model_btn.grid(row=3, column=2, padx=10, pady=6)
+
+        ctk.CTkLabel(frm, text="동시 번역 요청 수").grid(row=4, column=0, sticky="w", padx=10, pady=6)
+        ctk.CTkOptionMenu(frm, variable=self.workers_var, values=WORKER_CHOICES,
+                           width=90).grid(row=4, column=1, sticky="w", padx=10, pady=6)
+
+        self.hangul_plugin_var = tk.BooleanVar(value=True)
+        ctk.CTkCheckBox(frm, text="이름 입력창 한글 지원 플러그인 추가 (게임에 이름 입력이 있을 때)",
+                         variable=self.hangul_plugin_var).grid(
+            row=5, column=0, columnspan=3, sticky="w", padx=10, pady=6)
+
+        self.auto_shutdown_var = tk.BooleanVar(value=False)
+        ctk.CTkCheckBox(frm, text="완료 후 자동 종료 (검토 항목 없을 때만 - Ollama 끄고 PC 종료)",
+                         variable=self.auto_shutdown_var).grid(
+            row=6, column=0, columnspan=3, sticky="w", padx=10, pady=6)
+
+        self.notify_close_var = tk.BooleanVar(value=False)
+        ctk.CTkCheckBox(frm, text="완료 후 알림 (검토 항목 없으면 프로그램+Ollama도 종료, PC는 안 끔)",
+                         variable=self.notify_close_var).grid(
+            row=7, column=0, columnspan=3, sticky="w", padx=10, pady=6)
+
+        threading.Thread(target=self._refresh_models, daemon=True).start()
+
+        status_frm = ctk.CTkFrame(root, fg_color="transparent")
+        status_frm.pack(fill="x", padx=10, pady=(0, 6))
+        self.ollama_dot = tk.Canvas(status_frm, width=14, height=14, highlightthickness=0,
+                                     bg=self._bg_hex(self.root))
+        self.ollama_dot.pack(side="left", padx=(2, 6))
+        self._ollama_dot_id = self.ollama_dot.create_oval(2, 2, 12, 12, fill="#999999",
+                                                            outline="")
+        self.ollama_status_var = tk.StringVar(value="Ollama 상태: 확인 중...")
+        ctk.CTkLabel(status_frm, textvariable=self.ollama_status_var).pack(side="left")
+        self.ollama_btn = ctk.CTkButton(status_frm, text="...", width=110,
+                                         command=self._toggle_ollama, state="disabled")
+        self.ollama_btn.pack(side="right")
+
+        self._ollama_running = False
+        threading.Thread(target=self._ollama_status_loop, daemon=True).start()
+
+        btn_frm = ctk.CTkFrame(root, fg_color="transparent")
+        btn_frm.pack(fill="x", **pad)
+        self.start_btn = ctk.CTkButton(btn_frm, text="번역 시작", command=self._start)
+        self.start_btn.pack(side="left", padx=4)
+        self.cancel_btn = ctk.CTkButton(btn_frm, text="취소", command=self._cancel,
+                                         state="disabled", fg_color="#a83232",
+                                         hover_color="#8a2828")
+        self.cancel_btn.pack(side="left", padx=4)
+        self.open_btn = ctk.CTkButton(btn_frm, text="결과 폴더 열기", command=self._open_output,
+                                       state="disabled")
+        self.open_btn.pack(side="left", padx=4)
+        self.review_btn = ctk.CTkButton(btn_frm, text="검토 항목 보기", command=self._open_review,
+                                         state="disabled")
+        self.review_btn.pack(side="left", padx=4)
+        self.glossary_btn = ctk.CTkButton(btn_frm, text="용어집 확인/수정", command=self._open_glossary)
+        self.glossary_btn.pack(side="left", padx=4)
+
+        self.progress = ctk.CTkProgressBar(root)
+        self.progress.set(0)
+        self.progress.pack(fill="x", **pad)
+
+        log_frm = ctk.CTkFrame(root, fg_color="transparent")
+        log_frm.pack(fill="both", expand=True, **pad)
+        self.log_text = ctk.CTkTextbox(log_frm, wrap="word", state="disabled")
+        self.log_text.pack(fill="both", expand=True)
+
+        self.result_path: str | None = None
+        self.result_model: str | None = None
+        self.result_cache_path: str | None = None
+        root.after(100, self._poll_queue)
+
+    @staticmethod
+    def _bg_hex(widget) -> str:
+        """Resolves a CTk frame's current background color to a hex string
+        the plain tk.Canvas (used for the status dot) can use directly."""
+        try:
+            mode = 1 if ctk.get_appearance_mode() == "Dark" else 0
+            color = widget.cget("fg_color")
+            if isinstance(color, (list, tuple)):
+                color = color[mode]
+            if not color or color == "transparent":
+                return "#242424" if mode else "#ebebeb"
+            return color
+        except Exception:  # noqa: BLE001
+            return "#242424"
+
+    def _default_font(self) -> str:
+        for c in DEFAULT_FONT_CANDIDATES:
+            if os.path.exists(c):
+                return c
+        return ""
+
+    def _row(self, parent, row, label, var, browse_cmd):
+        ctk.CTkLabel(parent, text=label).grid(row=row, column=0, sticky="w", padx=10, pady=6)
+        ctk.CTkEntry(parent, textvariable=var).grid(row=row, column=1, sticky="we", padx=10, pady=6)
+        ctk.CTkButton(parent, text="찾아보기...", width=90,
+                       command=browse_cmd).grid(row=row, column=2, padx=10, pady=6)
+
+    def _browse_game(self):
+        path = filedialog.askdirectory(title="원본 게임 폴더 선택 (package.json 또는 www 폴더가 있는 곳)")
+        if path:
+            self.game_var.set(path)
+            if not self.out_var.get():
+                self.out_var.set(path + "_KO")
+
+    def _browse_out(self):
+        path = filedialog.askdirectory(title="출력 폴더 상위 위치 선택")
+        if path:
+            self.out_var.set(path)
+
+    def _browse_font(self):
+        path = filedialog.askopenfilename(title="한국어 지원 폰트 선택", filetypes=[("TrueType Font", "*.ttf")])
+        if path:
+            self.font_var.set(path)
+
+    def _refresh_models(self):
+        models = list_ollama_models()
+        self.q.put(("models", models))
+
+    def _ollama_status_loop(self):
+        """Polls Ollama's status every 4s. If it's unreachable but the tray
+        process is still alive -- the "server died, tray app didn't notice"
+        zombie state we've hit before -- auto-restarts it after a couple of
+        confirmations, throttled so a genuinely broken setup doesn't loop
+        forever."""
+        consecutive_down = 0
+        last_auto_restart = 0.0
+        while True:
+            running = ollama_ctl.is_running()
+            self.q.put(("ollama_status", running))
+
+            if running:
+                consecutive_down = 0
+            else:
+                consecutive_down += 1
+                now = time.time()
+                if (consecutive_down >= 2 and ollama_ctl.is_tray_running()
+                        and now - last_auto_restart > 60):
+                    last_auto_restart = now
+                    self.q.put(("log", "Ollama 응답 없음 감지 (트레이는 떠있는데 서버가 "
+                                        "죽은 상태) - 자동으로 재시작합니다..."))
+                    msg = ollama_ctl.restart()
+                    self.q.put(("log", msg))
+                    time.sleep(3)
+                    self.q.put(("ollama_status", ollama_ctl.is_running()))
+                    consecutive_down = 0
+
+            time.sleep(4)
+
+    def _confirm_ollama_stopped_then_close(self, attempts_left: int = 8):
+        """Polls is_running() (non-blocking, via root.after so the GUI stays
+        responsive) and re-issues a force-kill each time it's still up,
+        instead of just guessing a fixed delay is long enough. Only closes
+        the program once Ollama is actually confirmed dead -- if it still
+        won't die after repeated force-kills, gives up on auto-closing
+        (rather than closing anyway and leaving a live Ollama the user
+        doesn't know about) and leaves the window open with a warning."""
+        if not ollama_ctl.is_running():
+            self._append_log("Ollama 종료 확인됨 -> 프로그램을 종료합니다.")
+            self.root.destroy()
+            return
+        if attempts_left <= 0:
+            self._append_log("Ollama가 반복된 강제 종료 시도에도 계속 응답합니다. "
+                              "자동 종료를 포기하고 프로그램은 열어둡니다 -- 직접 확인해주세요.")
+            return
+        self._append_log(f"Ollama가 아직 살아있어 다시 강제 종료를 시도합니다... "
+                          f"(남은 시도: {attempts_left})")
+        ollama_ctl.stop()
+        self.root.after(1000, lambda: self._confirm_ollama_stopped_then_close(attempts_left - 1))
+
+    def _toggle_ollama(self):
+        if self.worker and self.worker.is_alive():
+            if not messagebox.askyesno(
+                "번역 진행 중",
+                "지금 번역이 돌고 있어요. Ollama를 중지하면 번역이 실패합니다.\n그래도 진행할까요?",
+            ):
+                return
+        self.ollama_btn.configure(state="disabled")
+        action = ollama_ctl.stop if self._ollama_running else ollama_ctl.start
+
+        def run():
+            msg = action()
+            self.q.put(("log", msg))
+            time.sleep(1.5)
+            self.q.put(("ollama_status", ollama_ctl.is_running()))
+
+        threading.Thread(target=run, daemon=True).start()
+
+    def _log(self, msg: str):
+        self.q.put(("log", msg))
+
+    def _download_model(self):
+        model = self.model_var.get().strip()
+        if not model:
+            messagebox.showerror("오류", "먼저 번역 모델 이름을 선택하거나 입력해주세요.")
+            return
+        if not self._ollama_running:
+            messagebox.showwarning(
+                "Ollama가 꺼져 있습니다",
+                "모델을 받으려면 먼저 Ollama를 실행해야 해요.",
+            )
+            return
+
+        self.download_model_btn.configure(state="disabled")
+        self._log(f"=== {model} 다운로드 시작 (용량에 따라 몇 분~수십 분 걸릴 수 있어요) ===")
+
+        def run():
+            try:
+                creationflags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
+                result = subprocess.run(
+                    ["ollama", "pull", model],
+                    capture_output=True, text=True, timeout=3600,
+                    creationflags=creationflags,
+                )
+                if result.returncode == 0:
+                    self.q.put(("log", f"=== {model} 다운로드 완료 ==="))
+                    self.q.put(("models", list_ollama_models()))
+                else:
+                    err = (result.stderr or result.stdout or "알 수 없는 오류").strip()
+                    self.q.put(("log", f"=== 다운로드 실패: {err} ==="))
+            except Exception as e:  # noqa: BLE001
+                self.q.put(("log", f"=== 다운로드 실패: {e} ==="))
+            finally:
+                self.q.put(("download_done", None))
+
+        threading.Thread(target=run, daemon=True).start()
+
+    @staticmethod
+    def _cache_path_for(out: str) -> str:
+        """The translation cache lives next to (not inside) the output
+        folder, named after it, so it survives the output folder being
+        deleted and recreated on a retried run."""
+        return os.path.abspath(os.path.join(out, "..", os.path.basename(out) + "_translations.json"))
+
+    def _start(self):
+        game = self.game_var.get().strip()
+        out = self.out_var.get().strip()
+        font = self.font_var.get().strip()
+        model = self.model_var.get().strip()
+
+        if not self._ollama_running:
+            messagebox.showwarning(
+                "Ollama가 꺼져 있습니다",
+                "번역을 시작하려면 먼저 Ollama를 실행해야 해요.\n"
+                "위의 'Ollama 시작' 버튼을 눌러 켠 뒤 다시 시도해주세요.",
+            )
+            return
+        if not game:
+            messagebox.showerror("오류", "원본 게임 폴더를 선택해주세요.")
+            return
+        if not out:
+            messagebox.showerror("오류", "출력 폴더를 지정해주세요.")
+            return
+        if os.path.exists(out):
+            answer = messagebox.askyesno(
+                "출력 폴더가 이미 존재합니다",
+                f"{out}\n\n이 폴더가 이미 있어요. 보통 이전에 실패했거나 중단된 작업의 "
+                "결과물입니다.\n\n삭제하고 원본에서 새로 복사해서 진행할까요?\n"
+                "('아니오'를 누르면 취소되고, 출력 폴더 경로를 직접 바꿔서 다시 시작할 수 있어요.)",
+            )
+            if not answer:
+                return
+            try:
+                shutil.rmtree(out)
+            except Exception as e:  # noqa: BLE001
+                messagebox.showerror("오류", f"출력 폴더 삭제에 실패했습니다:\n{e}")
+                return
+        if font and not os.path.exists(font):
+            messagebox.showerror("오류", f"폰트 파일을 찾을 수 없습니다:\n{font}")
+            return
+
+        self.cancel_flag = False
+        self.start_btn.configure(state="disabled")
+        self.cancel_btn.configure(state="normal")
+        self.open_btn.configure(state="disabled")
+        self.progress.set(0)
+        self._clear_log()
+
+        cache_path = self._cache_path_for(out)
+        self.result_model = model
+        self.result_cache_path = cache_path
+        self.review_btn.configure(state="disabled")
+
+        try:
+            workers = max(1, int(self.workers_var.get()))
+        except ValueError:
+            workers = 4
+
+        self.worker = threading.Thread(
+            target=self._run_worker,
+            args=(game, out, font or None, model, cache_path, workers,
+                  self.hangul_plugin_var.get()),
+            daemon=True,
+        )
+        self.worker.start()
+
+    def _run_worker(self, game, out, font, model, cache_path, workers, install_hangul_plugin):
+        try:
+            def progress(done, total):
+                self.q.put(("progress", (done, max(total, 1))))
+
+            def should_cancel():
+                return self.cancel_flag
+
+            result = run_all(
+                game=game, out=out, font=font, model=model, cache_path=cache_path,
+                log=self._log, progress=progress, should_cancel=should_cancel,
+                workers=workers, install_hangul_plugin=install_hangul_plugin,
+            )
+            self.q.put(("done", result))
+        except InterruptedError:
+            self.q.put(("cancelled", None))
+        except Exception as e:  # noqa: BLE001
+            self.q.put(("error", str(e)))
+
+    def _cancel(self):
+        self.cancel_flag = True
+        self.cancel_btn.configure(state="disabled")
+        self._log("취소 요청됨... 현재 번역이 끝나면 중단됩니다.")
+
+    def _open_output(self):
+        if self.result_path and os.path.exists(self.result_path):
+            os.startfile(self.result_path)  # noqa: S606 (Windows-only helper)
+
+    def _review_path(self) -> Path | None:
+        if not self.result_path:
+            return None
+        p = Path(self.result_path) / REVIEW_FILENAME
+        return p if p.exists() else None
+
+    def _review_count(self) -> int:
+        p = self._review_path()
+        if not p:
+            return 0
+        try:
+            return len(json.loads(p.read_text(encoding="utf-8")))
+        except Exception:  # noqa: BLE001
+            return 0
+
+    def _open_review(self):
+        p = self._review_path()
+        if not p or not self.result_model or not self.result_cache_path:
+            messagebox.showinfo("검토 항목 없음", "검토가 필요한 항목이 없어요.")
+            return
+        try:
+            items = json.loads(p.read_text(encoding="utf-8"))
+        except Exception as e:  # noqa: BLE001
+            messagebox.showerror("오류", f"검토 목록을 읽지 못했습니다:\n{e}")
+            return
+        ReviewWindow(self.root, self.result_path, self.result_model,
+                      self.result_cache_path, items, self._log)
+
+    def _open_glossary(self):
+        game = self.game_var.get().strip()
+        out = self.out_var.get().strip()
+        model = self.model_var.get().strip()
+        if not game:
+            messagebox.showerror("오류", "먼저 원본 게임 폴더를 선택해주세요.")
+            return
+        if not out:
+            messagebox.showerror("오류", "먼저 출력 폴더를 지정해주세요 (용어집도 번역 캐시 파일에 저장돼요).")
+            return
+        if not model:
+            messagebox.showerror("오류", "번역 모델을 선택해주세요.")
+            return
+        try:
+            layout = detect_project(game)
+            names = collect_glossary_names(layout)
+        except Exception as e:  # noqa: BLE001
+            messagebox.showerror("오류", f"게임 폴더를 분석하지 못했습니다:\n{e}")
+            return
+        if not names:
+            messagebox.showinfo("용어집 없음", "이 게임에서 고유명사(이름) 항목을 찾지 못했어요.")
+            return
+
+        cache_path = self._cache_path_for(out)
+        translator = OllamaTranslator(model=model, cache_path=cache_path)
+        items = [{"source": n, "translated": translator.cache.get(n) or ""} for n in sorted(names)]
+        GlossaryWindow(self.root, model, cache_path, items, self._log)
+
+    def _clear_log(self):
+        self.log_text.configure(state="normal")
+        self.log_text.delete("1.0", "end")
+        self.log_text.configure(state="disabled")
+
+    def _append_log(self, msg: str):
+        self.log_text.configure(state="normal")
+        self.log_text.insert("end", msg + "\n")
+        self.log_text.see("end")
+        self.log_text.configure(state="disabled")
+
+    def _poll_queue(self):
+        try:
+            while True:
+                kind, payload = self.q.get_nowait()
+                if kind == "log":
+                    self._append_log(str(payload))
+                elif kind == "progress":
+                    done, total = payload
+                    self.progress.set(done / max(total, 1))
+                elif kind == "models":
+                    self.model_combo.configure(values=payload)
+                elif kind == "download_done":
+                    self.download_model_btn.configure(state="normal")
+                elif kind == "ollama_status":
+                    self._ollama_running = bool(payload)
+                    if payload:
+                        self.ollama_dot.itemconfig(self._ollama_dot_id, fill="#2ecc71")
+                        self.ollama_status_var.set("Ollama 상태: 실행 중")
+                        self.ollama_btn.configure(text="Ollama 중지", state="normal")
+                    else:
+                        self.ollama_dot.itemconfig(self._ollama_dot_id, fill="#999999")
+                        self.ollama_status_var.set("Ollama 상태: 중지됨")
+                        self.ollama_btn.configure(text="Ollama 시작", state="normal")
+                elif kind == "done":
+                    self.result_path = payload
+                    self._append_log("=== 완료 ===")
+                    self.start_btn.configure(state="normal")
+                    self.cancel_btn.configure(state="disabled")
+                    self.open_btn.configure(state="normal")
+                    review_count = self._review_count()
+                    if review_count:
+                        self.review_btn.configure(state="normal")
+
+                    if self.notify_close_var.get() or self.auto_shutdown_var.get():
+                        body = (f"검토 필요 항목 {review_count}개" if review_count
+                                else "검토 항목 없음")
+                        self._append_log(notify.notify("쯔꾸르 한국어화 도구: 번역 완료", body))
+
+                    if review_count == 0 and self.auto_shutdown_var.get():
+                        self._append_log("검토 항목 없음 + 자동 종료 옵션 켜짐 -> Ollama를 끄고 "
+                                          "PC 종료를 예약합니다.")
+                        self._append_log(ollama_ctl.stop())
+                        self._append_log(power.schedule_shutdown(
+                            60, "쯔꾸르 한국어화 도구: 번역 완료, 검토 항목 없음 - 자동 종료"))
+                    elif review_count == 0 and self.notify_close_var.get():
+                        self._append_log("검토 항목 없음 + 알림 옵션 켜짐 -> Ollama 종료를 "
+                                          "확인한 뒤 프로그램을 닫습니다.")
+                        self._append_log(ollama_ctl.stop())
+                        self._confirm_ollama_stopped_then_close()
+                    elif review_count:
+                        messagebox.showinfo(
+                            "완료",
+                            f"번역이 완료되었습니다:\n{payload}\n\n"
+                            f"검토가 필요한 항목이 {review_count}개 있어요 "
+                            f"('검토 항목 보기' 버튼으로 확인).",
+                        )
+                    else:
+                        messagebox.showinfo("완료", f"번역이 완료되었습니다:\n{payload}")
+                elif kind == "cancelled":
+                    self._append_log("=== 취소됨 ===")
+                    self.start_btn.configure(state="normal")
+                    self.cancel_btn.configure(state="disabled")
+                elif kind == "error":
+                    self._append_log(f"=== 오류: {payload} ===")
+                    self.start_btn.configure(state="normal")
+                    self.cancel_btn.configure(state="disabled")
+                    messagebox.showerror("오류", str(payload))
+        except queue.Empty:
+            pass
+        self.root.after(100, self._poll_queue)
+
+
+_REASON_LABELS = {"fallback": "원문 유지", "length": "번역이 김"}
+
+
+class _TermListWindow(ctk.CTkToplevel):
+    """Shared list+detail term editor: a scrollable list of source strings
+    on the left, an editable translation box on the right. Both the
+    post-run review list (ReviewWindow) and the pre-run glossary editor
+    (GlossaryWindow) are this same UI -- they only differ in where their
+    items come from and what (if anything) needs patching after a save."""
+
+    def __init__(self, parent, title: str, log_label: str, model: str,
+                 cache_path: str, items: list[dict], log_fn, show_reason: bool):
+        super().__init__(parent)
+        self.title(title)
+        self.geometry("800x500")
+        self.log_label = log_label
+        self.model = model
+        self.cache_path = cache_path
+        self.items = items
+        self.log_fn = log_fn
+        self.show_reason = show_reason
+        self.selected_idx: int | None = None
+        self.item_buttons: list[ctk.CTkButton] = []
+
+        pane = ctk.CTkFrame(self, fg_color="transparent")
+        pane.pack(fill="both", expand=True, padx=10, pady=10)
+
+        left = ctk.CTkScrollableFrame(pane, width=280, label_text="항목 목록")
+        left.pack(side="left", fill="y")
+        self.list_frame = left
+
+        right = ctk.CTkFrame(pane, fg_color="transparent")
+        right.pack(side="left", fill="both", expand=True, padx=(10, 0))
+
+        if show_reason:
+            ctk.CTkLabel(right, text="사유").pack(anchor="w")
+            self.reason_var = tk.StringVar()
+            ctk.CTkLabel(right, textvariable=self.reason_var).pack(anchor="w")
+
+        ctk.CTkLabel(right, text="원문").pack(anchor="w", pady=(8, 0))
+        self.source_text = ctk.CTkTextbox(right, height=80, wrap="word", state="disabled")
+        self.source_text.pack(fill="x")
+
+        ctk.CTkLabel(right, text="번역 (직접 고칠 수 있어요)").pack(anchor="w", pady=(8, 0))
+        self.translated_text = ctk.CTkTextbox(right, height=140, wrap="word")
+        self.translated_text.pack(fill="both", expand=True)
+
+        btn_row = ctk.CTkFrame(right, fg_color="transparent")
+        btn_row.pack(fill="x", pady=8)
+        self.save_btn = ctk.CTkButton(btn_row, text="저장", command=self._save)
+        self.save_btn.pack(side="left", padx=4)
+        self.retranslate_btn = ctk.CTkButton(btn_row, text="번역 받기", command=self._retranslate)
+        self.retranslate_btn.pack(side="left", padx=4)
+        ctk.CTkButton(btn_row, text="닫기", fg_color="#555", hover_color="#444",
+                       command=self.destroy).pack(side="right", padx=4)
+
+        self._refresh_listbox()
+        if self.items:
+            self._select(0)
+
+    def _list_label(self, item: dict) -> str:
+        if self.show_reason:
+            return f"[{_REASON_LABELS.get(item['reason'], item['reason'])}] {item['source'][:22]}"
+        mark = "✓" if item.get("translated") else "…"
+        return f"[{mark}] {item['source'][:22]}"
+
+    def _refresh_listbox(self):
+        for b in self.item_buttons:
+            b.destroy()
+        self.item_buttons = []
+        for i, it in enumerate(self.items):
+            btn = ctk.CTkButton(
+                self.list_frame, text=self._list_label(it), anchor="w",
+                fg_color="transparent", text_color=("black", "white"),
+                hover_color=("#dddddd", "#333333"),
+                command=lambda idx=i: self._select(idx),
+            )
+            btn.pack(fill="x", pady=2)
+            self.item_buttons.append(btn)
+        self._highlight_selected()
+
+    def _highlight_selected(self):
+        for i, b in enumerate(self.item_buttons):
+            if i == self.selected_idx:
+                b.configure(fg_color=("#c7dcff", "#254a7a"))
+            else:
+                b.configure(fg_color="transparent")
+
+    def _select(self, idx: int):
+        self.selected_idx = idx
+        self._highlight_selected()
+        item = self.items[idx]
+        if self.show_reason:
+            self.reason_var.set(_REASON_LABELS.get(item["reason"], item["reason"]))
+        self.source_text.configure(state="normal")
+        self.source_text.delete("1.0", "end")
+        self.source_text.insert("1.0", item["source"])
+        self.source_text.configure(state="disabled")
+        self.translated_text.delete("1.0", "end")
+        self.translated_text.insert("1.0", item.get("translated", ""))
+
+    def _after_save(self, item: dict, old_value: str, new_value: str) -> None:
+        """Hook for subclasses that need to react to a saved edit (e.g. patch
+        already-generated output files). No-op by default."""
+
+    def _save(self):
+        if self.selected_idx is None:
+            return
+        item = self.items[self.selected_idx]
+        new_value = self.translated_text.get("1.0", "end").strip()
+        old_value = item.get("translated", "")
+        if new_value == old_value:
+            return
+        try:
+            translator = OllamaTranslator(model=self.model, cache_path=self.cache_path)
+            translator.cache.set(item["source"], new_value)
+            translator.cache.save()
+            self._after_save(item, old_value, new_value)
+        except Exception as e:  # noqa: BLE001
+            messagebox.showerror("오류", f"저장에 실패했습니다:\n{e}")
+            return
+        item["translated"] = new_value
+        self.log_fn(f"{self.log_label}: 수정 저장됨 -> {item['source'][:30]}")
+        self._refresh_listbox()
+
+    def _retranslate(self):
+        if self.selected_idx is None:
+            return
+        idx = self.selected_idx
+        item = self.items[idx]
+        self.save_btn.configure(state="disabled")
+        self.retranslate_btn.configure(state="disabled")
+
+        def run():
+            try:
+                translator = OllamaTranslator(model=self.model, cache_path=self.cache_path)
+                old_value = item.get("translated", "")
+                translator.cache.data.pop(item["source"], None)
+                new_value = translator.translate(item["source"])
+                translator.cache.save()
+                self._after_save(item, old_value, new_value)
+            except Exception as e:  # noqa: BLE001
+                self.after(0, lambda: messagebox.showerror("오류", f"번역에 실패했습니다:\n{e}"))
+                self.after(0, self._retranslate_done, None)
+                return
+            self.after(0, self._retranslate_done, new_value)
+
+        threading.Thread(target=run, daemon=True).start()
+
+    def _retranslate_done(self, new_value):
+        self.save_btn.configure(state="normal")
+        self.retranslate_btn.configure(state="normal")
+        if new_value is None or self.selected_idx is None:
+            return
+        idx = self.selected_idx
+        self.items[idx]["translated"] = new_value
+        self.log_fn(f"{self.log_label}: 번역 받음 -> {self.items[idx]['source'][:30]}")
+        self._refresh_listbox()
+        self._select(idx)
+
+
+class ReviewWindow(_TermListWindow):
+    """Lists the entries pipeline.run_all() flagged as needing a look --
+    either the model never produced Korean (source text was kept as-is) or
+    the Korean came out much longer than the source (overflow risk). Lets
+    you hand-edit a translation or force a single re-translate, and patches
+    the on-disk cache, the already-generated output JSON files, and the
+    render-time patch (js/korean_patch.js) so a plugin-text edit actually
+    shows up in-game too, not just in data/*.json."""
+
+    def __init__(self, parent, out_path: str, model: str, cache_path: str,
+                 items: list[dict], log_fn):
+        self.out_path = out_path
+        super().__init__(parent, f"검토 항목 ({len(items)}개)", "검토", model,
+                          cache_path, items, log_fn, show_reason=True)
+
+    def _after_save(self, item, old_value, new_value):
+        layout = detect_project(self.out_path)
+        walk_project(layout, lambda t: new_value if t == old_value else t)
+        translator = OllamaTranslator(model=self.model, cache_path=self.cache_path)
+        translation_map = build_translation_map(translator.cache.data)
+        inject_render_patch(layout, translation_map)
+
+
+class GlossaryWindow(_TermListWindow):
+    """Pre-run editor for proper nouns (actor/class/item/... names, map
+    display names, MZ name-box speaker names) -- lets you pin a name's
+    Korean rendering by hand (or fetch one from the model) before starting
+    the main translation, so run_all()'s glossary pass picks it up and the
+    same choice gets used everywhere that name appears. Only ever writes to
+    the translation cache; there's no output folder yet to patch."""
+
+    def __init__(self, parent, model: str, cache_path: str, items: list[dict], log_fn):
+        super().__init__(parent, f"용어집 ({len(items)}개)", "용어집", model,
+                          cache_path, items, log_fn, show_reason=False)
+
+
+def main():
+    root = ctk.CTk()
+    LocalizerGUI(root)
+    root.mainloop()
+
+
+if __name__ == "__main__":
+    main()
