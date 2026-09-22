@@ -17,17 +17,23 @@ from engine import ProjectLayout
 
 # Event command codes that carry player-visible text, and which
 # parameter index holds the text (or "list" for a list-of-strings param).
+# 401/405 lines are handled separately as whole paragraphs (PARAGRAPH_CODES).
 TEXT_COMMANDS = {
     101: [4],         # Show Text (header): parameters[4] is the MZ name-box
                        # speaker name, if present (MV/older MZ has no index 4)
-    401: [0],        # Show Text (a line of the message)
-    405: [0],         # Show Scrolling Text (a line)
     102: ["list0"],   # Show Choices: parameters[0] is a list of strings
     320: [1],         # Change Name
     324: [1],         # Change Nickname
     325: [1],         # Change Profile
     331: [1],         # (some plugins) misc name-like text - harmless if unused
 }
+
+# A message is stored as one command per window line (401 = Show Text line,
+# 405 = Show Scrolling Text line). Translating each line on its own cuts
+# sentences at the Japanese line breaks, so consecutive lines are handed to
+# the callback as one "\n"-joined paragraph and split back afterwards. The
+# number of commands never changes -- the event structure must stay intact.
+PARAGRAPH_CODES = (401, 405)
 
 DB_TEXT_FIELDS = ["name", "description", "message1", "message2", "message3",
                    "message4", "nickname", "profile"]
@@ -38,9 +44,51 @@ DB_FILES = ["Actors.json", "Classes.json", "Skills.json", "Items.json",
 Callback = Callable[[str], str]
 
 
+def fit_lines(text: str, n: int) -> list[str]:
+    """Splits a translated paragraph back onto exactly `n` command lines.
+    Extra lines are kept together (as "\\n") on the last command -- the
+    message window turns them into a new page -- and missing ones become
+    empty lines."""
+    lines = text.split("\n")
+    if len(lines) <= n:
+        return lines + [""] * (n - len(lines))
+    return lines[:n - 1] + ["\n".join(lines[n - 1:])]
+
+
+def _walk_paragraph(block: list, cb: Callback) -> None:
+    lines = [c["parameters"][0] for c in block]
+    end = len(lines)
+    while end and not lines[end - 1].strip():
+        end -= 1  # trailing blank lines aren't part of the paragraph's text
+    if not end:
+        return
+    paragraph = "\n".join(lines[:end])
+    out = cb(paragraph)
+    if out == paragraph:
+        return
+    for cmd, line in zip(block, fit_lines(out, len(block))):
+        cmd["parameters"][0] = line
+
+
+def _is_paragraph_line(cmd: dict, code: int, indent) -> bool:
+    params = cmd.get("parameters")
+    return (cmd.get("code") == code and cmd.get("indent") == indent
+            and bool(params) and isinstance(params[0], str))
+
+
 def _walk_command_list(commands: list, cb: Callback) -> None:
-    for cmd in commands:
+    i = 0
+    while i < len(commands):
+        cmd = commands[i]
         code = cmd.get("code")
+        if code in PARAGRAPH_CODES and _is_paragraph_line(cmd, code, cmd.get("indent")):
+            j = i + 1
+            while j < len(commands) and _is_paragraph_line(commands[j], code, cmd.get("indent")):
+                j += 1
+            _walk_paragraph(commands[i:j], cb)
+            i = j
+            continue
+        i += 1
         spec = TEXT_COMMANDS.get(code)
         if not spec:
             continue

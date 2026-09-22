@@ -17,6 +17,14 @@ def test_build_translation_map_drops_fallback_entries():
     assert result == {"こんにちは": "안녕하세요"}
 
 
+def test_patch_looks_up_again_after_escape_conversion():
+    # Names inserted by \N[n] (e.g. an actor name kept original in data
+    # because a plugin references it) only exist after conversion; verified
+    # in a real browser against a stub Window_Base when this was added.
+    from render_patch import _PATCH_TEMPLATE
+    assert "return lookup(_convertEscapeCharacters.call(this, lookup(text)));" in _PATCH_TEMPLATE
+
+
 def _make_layout(root: Path) -> ProjectLayout:
     root.mkdir(parents=True, exist_ok=True)
     return ProjectLayout(root=root, data_dir=root / "data", fonts_dir=root / "fonts",

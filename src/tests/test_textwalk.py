@@ -2,14 +2,18 @@ import json
 import sys
 from pathlib import Path
 
+import pytest
+
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from engine import ProjectLayout  # noqa: E402
 from textwalk import (  # noqa: E402
     _extract_ja_fragments,
     _extract_plugin_command_text,
+    _walk_command_list,
     collect_glossary_names,
     collect_plugin_command_texts,
+    fit_lines,
     walk_project,
 )
 
@@ -153,6 +157,74 @@ def test_extract_ja_fragments_drops_escape_codes_and_digits():
     assert _extract_ja_fragments("\\ow[5]行動力: \\V[41]/5") == ["行動力"]
     assert _extract_ja_fragments("ChangeMap 3 5 5") == []
     assert _extract_ja_fragments("\\ow[5]好感度: \\V[43]") == ["好感度"]
+
+
+def _msg(*lines, code=401, indent=0):
+    return [{"code": code, "indent": indent, "parameters": [ln]} for ln in lines]
+
+
+def _texts(cmds):
+    return [c["parameters"][0] for c in cmds if c["code"] in (401, 405)]
+
+
+def test_consecutive_message_lines_are_one_paragraph():
+    cmds = [{"code": 101, "indent": 0, "parameters": ["", 0, 0, 2]}] + _msg("おはよう。", "今日は", "いい天気だね。")
+    seen = []
+    _walk_command_list(cmds, lambda t: seen.append(t) or t)
+    assert seen == ["おはよう。\n今日は\nいい天気だね。"]
+
+
+def test_paragraph_split_back_keeps_command_count():
+    cmds = _msg("一", "二", "三")
+    _walk_command_list(cmds, lambda t: "하나\n둘")  # fewer lines than the source
+    assert len(cmds) == 3
+    assert _texts(cmds) == ["하나", "둘", ""]
+
+    cmds = _msg("一", "二")
+    _walk_command_list(cmds, lambda t: "하나\n둘\n셋")  # more lines than the source
+    assert len(cmds) == 2
+    assert _texts(cmds) == ["하나", "둘\n셋"]
+
+
+def test_separate_messages_and_other_indents_are_not_merged():
+    cmds = (_msg("第一") + [{"code": 101, "indent": 0, "parameters": ["", 0, 0, 2]}]
+            + _msg("第二") + _msg("別の枝", indent=1))
+    seen = []
+    _walk_command_list(cmds, lambda t: seen.append(t) or t)
+    assert seen == ["第一", "第二", "別の枝"]
+
+
+def test_trailing_blank_lines_are_not_part_of_the_paragraph():
+    cmds = _msg("本文", "")
+    seen = []
+    _walk_command_list(cmds, lambda t: seen.append(t) or "번역")
+    assert seen == ["本文"]
+    assert _texts(cmds) == ["번역", ""]
+
+
+def test_blank_only_message_is_skipped():
+    cmds = _msg("", "  ")
+    _walk_command_list(cmds, lambda t: pytest.fail("callback must not run"))
+
+
+def test_scrolling_text_lines_are_merged_too():
+    cmds = _msg("スクロール", "テキスト", code=405)
+    seen = []
+    _walk_command_list(cmds, lambda t: seen.append(t) or t)
+    assert seen == ["スクロール\nテキスト"]
+
+
+def test_unchanged_paragraph_is_left_byte_for_byte():
+    cmds = _msg("一", "  二  ")
+    _walk_command_list(cmds, lambda t: t)
+    assert _texts(cmds) == ["一", "  二  "]
+
+
+def test_fit_lines():
+    assert fit_lines("a\nb", 2) == ["a", "b"]
+    assert fit_lines("a", 3) == ["a", "", ""]
+    assert fit_lines("a\nb\nc\nd", 2) == ["a", "b\nc\nd"]
+    assert fit_lines("a\nb", 1) == ["a\nb"]
 
 
 def test_collect_glossary_names_is_consistent_with_walk(tmp_path):

@@ -119,7 +119,13 @@ _PATCH_TEMPLATE = """\
         if (Window_Base.prototype.convertEscapeCharacters) {{
             var _convertEscapeCharacters = Window_Base.prototype.convertEscapeCharacters;
             Window_Base.prototype.convertEscapeCharacters = function(text) {{
-                return _convertEscapeCharacters.call(this, lookup(text));
+                // Look up once before conversion (so "好感度 \\V[43]" can match
+                // as written in the data) and once after: \\N[n] / \\P[n] and
+                // plugin codes insert names only during conversion, and a name
+                // kept original in data/*.json because a plugin looks it up
+                // would otherwise show up untranslated in the middle of a
+                // translated sentence.
+                return lookup(_convertEscapeCharacters.call(this, lookup(text)));
             }};
         }}
         if (Window_Base.prototype.drawText) {{

@@ -20,6 +20,7 @@ from plugin_install import install_hangul_name_plugin
 from plugin_text import collect_plugin_strings
 from render_patch import build_translation_map, inject_render_patch
 from providers import FatalProviderError, Provider, run_api_pass
+from refindex import build_reference_index
 from textwalk import walk_project, collect_glossary_names, collect_plugin_command_texts
 from translator import PROBLEM_LABELS, OllamaTranslator, flag_reason
 
@@ -78,6 +79,26 @@ def _translate_batch(
     if cancelled.is_set():
         log("사용자가 취소했습니다. 지금까지의 번역은 캐시에 저장되었습니다.")
         raise InterruptedError("cancelled")
+
+
+def _reuse_line_translations(texts: list[str], cache) -> int:
+    """Multi-line messages used to be translated one line at a time, so an
+    existing cache holds each line separately. Now that they're translated
+    as whole paragraphs, stitch those old line translations together
+    instead of paying to re-translate the whole game. Returns how many
+    paragraphs were filled this way."""
+    reused = 0
+    for text in texts:
+        if "\n" not in text or cache.get(text) is not None:
+            continue
+        lines = text.split("\n")
+        parts = [cache.get(ln) if ln.strip() else ln for ln in lines]
+        if any(p is None for p in parts):
+            continue
+        first = next(ln for ln in lines if ln.strip())
+        cache.set(text, "\n".join(parts), origin=cache.get_origin(first))
+        reused += 1
+    return reused
 
 
 def _translate_texts(
@@ -240,13 +261,30 @@ def run_all(
     texts.extend(plugin_cmd_texts)
 
     unique = sorted(set(texts))
+    reused = _reuse_line_translations(unique, translator.cache)
+    if reused:
+        translator.cache.save()
+        log(f"기존 줄 단위 번역을 이어붙여 여러 줄 대사 {reused}개를 다시 번역하지 않고 재사용합니다.")
     todo = [t for t in unique if translator.cache.get(t) is None]
     log(f"총 {len(unique)}개 고유 텍스트, 이 중 {len(todo)}개 새로 번역합니다.")
 
     _translate_texts(todo, translator, provider, mode, workers, log, progress, should_cancel,
                      "본문")
 
+    # Text that the game also uses as a lookup key (a skill named in a note
+    # tag, an item compared in a script, ...) stays original in data/*.json
+    # so those lookups keep working; its translation still reaches the
+    # screen through the render-time patch below.
+    refs = build_reference_index(out_layout)
+    guarded = {t for t in unique if t.strip() in refs}
+    if guarded:
+        examples = ", ".join(sorted(guarded, key=len)[:8])
+        log(f"게임이 이름으로 찾아 쓰는 값과 같은 텍스트 {len(guarded)}개는 데이터 파일에는 "
+            f"원문으로 두고, 화면에 그릴 때만 번역합니다 (예: {examples}).")
+
     def replace(text: str) -> str:
+        if text in guarded:
+            return text
         cached = translator.cache.get(text)
         return cached if cached is not None else text
 

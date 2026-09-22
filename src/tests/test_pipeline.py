@@ -162,6 +162,20 @@ def test_hybrid_mode_falls_back_to_local_on_fatal_error(tmp_path, monkeypatch):
     assert any("API 사용 중단" in line for line in logs)
 
 
+def test_old_line_by_line_cache_is_reused_for_merged_paragraphs(tmp_path):
+    cache = Cache(str(tmp_path / "c.json"))
+    cache.set("おはよう。", "좋은 아침.", origin="local:m")
+    cache.set("今日は晴れ。", "오늘은 맑음.", origin="local:m")
+    cache.set("一行目", "첫 줄")
+
+    texts = ["おはよう。\n今日は晴れ。", "おはよう。\n\n今日は晴れ。", "一行目\n未翻訳の行", "単独"]
+    assert pipeline._reuse_line_translations(texts, cache) == 2
+    assert cache.get("おはよう。\n今日は晴れ。") == "좋은 아침.\n오늘은 맑음."
+    assert cache.get_origin("おはよう。\n今日は晴れ。") == "local:m"
+    assert cache.get("おはよう。\n\n今日は晴れ。") == "좋은 아침.\n\n오늘은 맑음."
+    assert cache.get("一行目\n未翻訳の行") is None, "a missing line means translate it fresh"
+
+
 def test_api_mode_without_required_key_is_rejected_before_touching_files(tmp_path):
     from providers import DeepL
     with pytest.raises(RuntimeError, match="API 키"):
