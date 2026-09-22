@@ -2,6 +2,7 @@
 # and must never be committed.
 *_KO/
 *_translations.json
+*_log.txt
 _translation_review.json
 
 # Python build artifacts

@@ -7,6 +7,7 @@ front-end can render status its own way (print / log box / progress bar).
 from __future__ import annotations
 
 import json
+import re
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
@@ -18,10 +19,14 @@ from fonts import swap_font
 from plugin_install import install_hangul_name_plugin
 from plugin_text import collect_plugin_strings
 from render_patch import build_translation_map, inject_render_patch
+from providers import FatalProviderError, Provider, run_api_pass
 from textwalk import walk_project, collect_glossary_names, collect_plugin_command_texts
-from translator import OllamaTranslator, flag_reason
+from translator import PROBLEM_LABELS, OllamaTranslator, flag_reason
 
 REVIEW_FILENAME = "_translation_review.json"
+
+MODE_LABELS = {"hybrid": "API 우선 + 로컬 보완", "api": "API만", "local": "로컬만"}
+_JA_RE = re.compile(r"[぀-ヿ一-鿿]")
 
 LogFn = Callable[[str], None]
 ProgressFn = Callable[[int, int], None]  # (done, total)
@@ -75,6 +80,50 @@ def _translate_batch(
         raise InterruptedError("cancelled")
 
 
+def _translate_texts(
+    todo: list[str],
+    translator: OllamaTranslator,
+    provider: Optional[Provider],
+    mode: str,
+    workers: int,
+    log: LogFn,
+    progress: Optional[ProgressFn],
+    should_cancel: Optional[Callable[[], bool]],
+    label: str,
+) -> None:
+    """API first (when the mode uses it), then the local model for whatever
+    the API didn't get right. In "api" mode the leftovers stay untranslated
+    and show up in the review list instead."""
+    remaining = list(todo)
+    if provider is not None and mode in ("api", "hybrid") and remaining:
+        log(f"{label}: {provider.label}(으)로 {len(remaining)}개 1차 번역합니다.")
+        res = run_api_pass(provider, remaining, translator.cache, log, progress, should_cancel,
+                           label, split_refused=(mode == "api"))
+        remaining = res.failed
+        counts: dict[str, int] = {}
+        for reason in res.reasons.values():
+            counts[reason] = counts.get(reason, 0) + 1
+        detail = ", ".join(f"{PROBLEM_LABELS.get(r, r)} {n}" for r, n in
+                           sorted(counts.items(), key=lambda kv: -kv[1]))
+        log(f"  {label} API 결과: 성공 {res.ok}개, 실패 {len(remaining)}개"
+            + (f" ({detail})" if detail else ""))
+        for msg, n in list(res.errors.items())[:3]:
+            log(f"  API 오류 {n}회: {msg}")
+        if res.fatal:
+            log(f"  API 사용 중단: {res.fatal}")
+            if mode == "api":
+                raise RuntimeError(f"API 번역을 계속할 수 없습니다: {res.fatal}")
+    if not remaining:
+        return
+    if mode in ("local", "hybrid"):
+        if mode == "hybrid":
+            log(f"  {label}: 나머지 {len(remaining)}개를 로컬 모델({translator.model})로 번역합니다.")
+        _translate_batch(translator, remaining, workers, log, progress, should_cancel,
+                         f"{label} 로컬")
+    else:
+        log(f"  {label}: API로 번역하지 못한 {len(remaining)}개는 원문 그대로 두고 검토 목록에 올립니다.")
+
+
 def run_all(
     game: str,
     out: str,
@@ -86,8 +135,26 @@ def run_all(
     should_cancel: Optional[Callable[[], bool]] = None,
     workers: int = 4,
     install_hangul_plugin: bool = True,
+    mode: str = "local",
+    provider: Optional[Provider] = None,
 ) -> str:
-    """Runs the full localization pipeline. Returns the output game path."""
+    """Runs the full localization pipeline. Returns the output game path.
+
+    `model` is the local (Ollama) model. `mode` is "local", "api", or
+    "hybrid" (API first, local model re-does what the API got wrong);
+    the API modes need `provider`."""
+    if mode not in MODE_LABELS:
+        raise ValueError(f"알 수 없는 번역 방식: {mode}")
+    if mode != "local":
+        if provider is None:
+            raise RuntimeError("API 번역 엔진이 지정되지 않았습니다.")
+        try:
+            provider.validate()
+        except FatalProviderError as e:
+            raise RuntimeError(str(e)) from None
+    else:
+        provider = None
+
     src_layout = detect_project(game)
     log(f"엔진 감지: {src_layout.engine} ({src_layout.root})")
 
@@ -121,6 +188,9 @@ def run_all(
             log(msg)
 
     translator = OllamaTranslator(model=model, cache_path=cache_path, log=log)
+    engine_desc = f"로컬 모델: {model}" if provider is None else (
+        f"API: {provider.label}" + ("" if mode == "api" else f", 로컬 모델: {model}"))
+    log(f"번역 방식: {MODE_LABELS[mode]} ({engine_desc})")
 
     # Pass 1: translate proper nouns (actor names, name-box speaker names)
     # first, then feed them back as a glossary so the same name comes out
@@ -130,10 +200,12 @@ def run_all(
     if glossary_todo:
         log(f"고유명사 {len(glossary_names)}개 중 {len(glossary_todo)}개를 먼저 번역해 "
             f"용어집을 만듭니다.")
-        _translate_batch(translator, glossary_todo, workers, log, None,
-                          should_cancel, "용어집 번역 중...")
-    glossary = {n: translator.cache.get(n) for n in glossary_names}
+        _translate_texts(glossary_todo, translator, provider, mode, workers, log, None,
+                         should_cancel, "용어집")
+    glossary = {n: t for n in glossary_names if (t := translator.cache.get(n))}
     translator.set_glossary(glossary)
+    if provider is not None:
+        provider.set_glossary(glossary)
 
     # Pass 2: everything else, now with the glossary steering embedded mentions.
     texts: list[str] = []
@@ -169,10 +241,10 @@ def run_all(
 
     unique = sorted(set(texts))
     todo = [t for t in unique if translator.cache.get(t) is None]
-    log(f"총 {len(unique)}개 고유 텍스트, 이 중 {len(todo)}개 새로 번역합니다 "
-        f"(모델: {model}, 동시 요청: {workers}개).")
+    log(f"총 {len(unique)}개 고유 텍스트, 이 중 {len(todo)}개 새로 번역합니다.")
 
-    _translate_batch(translator, todo, workers, log, progress, should_cancel, "번역 중...")
+    _translate_texts(todo, translator, provider, mode, workers, log, progress, should_cancel,
+                     "본문")
 
     def replace(text: str) -> str:
         cached = translator.cache.get(text)
@@ -193,22 +265,29 @@ def run_all(
         log("index.html을 찾지 못해 화면 출력 시점 패치는 건너뜁니다.")
 
     # Post-run review list: entries that fell back to the source text after
-    # every retry, or came out suspiciously long (message-box overflow risk).
+    # every retry, came out suspiciously long (message-box overflow risk),
+    # or never got translated at all (API-only mode, API failed on them).
     flagged = []
     for src in unique:
         translated = translator.cache.get(src)
         if translated is None:
+            if _JA_RE.search(src):
+                flagged.append({"source": src, "translated": "", "reason": "untranslated",
+                                "origin": None})
             continue
         reason = flag_reason(src, translated)
         if reason:
-            flagged.append({"source": src, "translated": translated, "reason": reason})
+            flagged.append({"source": src, "translated": translated, "reason": reason,
+                            "origin": translator.cache.get_origin(src)})
     review_path = game_root / REVIEW_FILENAME
     review_path.write_text(json.dumps(flagged, ensure_ascii=False, indent=2), encoding="utf-8")
     if flagged:
         fallback_n = sum(1 for f in flagged if f["reason"] == "fallback")
         length_n = sum(1 for f in flagged if f["reason"] == "length")
+        untranslated_n = sum(1 for f in flagged if f["reason"] == "untranslated")
         log(f"검토가 필요한 항목 {len(flagged)}개 (원문 유지 {fallback_n}개, "
-            f"번역이 원문보다 많이 김 {length_n}개) -> {review_path.name}")
+            f"번역이 원문보다 많이 김 {length_n}개, 번역 안 됨 {untranslated_n}개) "
+            f"-> {review_path.name}")
     else:
         log("검토가 필요한 항목 없음.")
 

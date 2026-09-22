@@ -83,6 +83,55 @@ def _is_bad_translation(original: str, translated: str) -> bool:
             or _looks_like_leaked_explanation(original, translated))
 
 
+_KANA_RE = re.compile(r"[぀-ゟ゠-ヿ]")
+# An LLM API declining the request (adult game text trips some providers'
+# filters) answers in prose instead of translating. Kept narrow on purpose:
+# a plain "죄송합니다" is also ordinary translated dialogue.
+_REFUSAL_RE = re.compile(
+    r"I(?:'m| am) sorry|I can(?:no|')t|I'm unable|as an AI|번역(?:해 드릴|할) 수 없|"
+    r"도와(?:드릴|줄) 수 없|요청(?:은|을|에) (?:응할|처리할|도와드릴) 수 없|부적절한 (?:내용|요청)",
+    re.IGNORECASE,
+)
+
+# Reason codes api_result_problem() returns, for logs and the review list.
+PROBLEM_LABELS = {
+    "code_lost": "제어 코드 손상",
+    "not_korean": "한글 없음",
+    "japanese_left": "일본어 남음",
+    "foreign": "다른 언어 섞임",
+    "odd": "설명/거절 응답",
+    "api_error": "API 오류",
+    "refused": "API 거절",
+    "api_stopped": "API 중단",
+}
+
+
+def api_result_problem(protected_src: str, candidate: str, mapping: dict[str, str]) -> str | None:
+    """Checks one API translation (still in protected form) before it's
+    accepted. Returns None if it's fine, else a PROBLEM_LABELS key -- in
+    hybrid mode anything flagged here is re-done by the local model instead.
+
+    Stricter than the local path's _is_bad_translation on purpose: leftover
+    kana is allowed there (the local model is the last resort) but here it
+    just means "let the local model have a go"."""
+    if any(token not in candidate for token in mapping):
+        return "code_lost"
+    if not _looks_translated(protected_src, candidate):
+        return "not_korean"
+    if _KANA_RE.search(candidate):
+        return "japanese_left"
+    if _has_foreign_leakage(protected_src, candidate):
+        return "foreign"
+    # Not _looks_like_leaked_explanation(): its phrase list includes everyday
+    # words ("위해") that would bounce perfectly good API output to the local
+    # model. Only the refusal wording and the short-source-ballooned shape.
+    if _REFUSAL_RE.search(candidate):
+        return "odd"
+    if len(protected_src) <= 20 and len(candidate) > max(30, len(protected_src) * 4):
+        return "odd"
+    return None
+
+
 def flag_reason(original: str, translated: str) -> str | None:
     """Classifies a finished (cached) translation for the post-run review
     list. Returns None if it looks fine, otherwise a short reason code:
@@ -207,25 +256,57 @@ def restore_codes(text: str, mapping: dict[str, str]) -> str:
     return text
 
 
+_CACHE_FORMAT = 2
+
+
 class Cache:
+    """Source text -> translation, plus where each translation came from
+    ("api:<engine>", "local:<model>", "manual"; absent for entries carried
+    over from the old flat cache format).
+
+    On disk: {"format": 2, "translations": {...}, "origin": {...}}. The old
+    flat {source: translation} file is still read transparently, and gets
+    rewritten in the new format on the next save."""
+
     def __init__(self, path: str):
         self.path = Path(path)
         self.data: dict[str, str] = {}
+        self.origin: dict[str, str] = {}
         self._lock = threading.Lock()
         if self.path.exists():
-            self.data = json.loads(self.path.read_text(encoding="utf-8"))
+            raw = json.loads(self.path.read_text(encoding="utf-8"))
+            if (isinstance(raw, dict) and raw.get("format") == _CACHE_FORMAT
+                    and isinstance(raw.get("translations"), dict)):
+                self.data = raw["translations"]
+                self.origin = raw.get("origin") or {}
+            else:
+                self.data = raw
 
     def get(self, key: str) -> str | None:
         with self._lock:
             return self.data.get(key)
 
-    def set(self, key: str, value: str) -> None:
+    def get_origin(self, key: str) -> str | None:
+        with self._lock:
+            return self.origin.get(key)
+
+    def set(self, key: str, value: str, origin: str | None = None) -> None:
         with self._lock:
             self.data[key] = value
+            if origin:
+                self.origin[key] = origin
+            else:
+                self.origin.pop(key, None)
+
+    def delete(self, key: str) -> None:
+        with self._lock:
+            self.data.pop(key, None)
+            self.origin.pop(key, None)
 
     def save(self) -> None:
         with self._lock:
-            snapshot = dict(self.data)
+            snapshot = {"format": _CACHE_FORMAT, "translations": dict(self.data),
+                        "origin": dict(self.origin)}
         # Serialize/write outside the lock so a slow disk doesn't block other threads.
         self.path.write_text(
             json.dumps(snapshot, ensure_ascii=False, indent=2), encoding="utf-8"
@@ -305,7 +386,7 @@ class OllamaTranslator:
             candidate = protected
 
         translated = restore_codes(candidate, mapping)
-        self.cache.set(text, translated)
+        self.cache.set(text, translated, origin=f"local:{self.model}")
         return translated
 
     def _call_model(self, protected_text: str) -> str:

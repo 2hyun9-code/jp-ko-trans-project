@@ -89,3 +89,83 @@ def test_run_all_reports_the_launchable_game_root_for_asar_games(tmp_path, monke
     assert (Path(result) / "resources" / "app.asar.bak").exists(), "original asar renamed aside"
     assert not (Path(result) / "resources" / "app.asar").exists(), "no stale app.asar left for Electron to prefer"
     assert (Path(result) / "resources" / "app" / "project" / "data" / "System.json").exists()
+
+
+# ---------------------------------------------------------------- API modes
+
+import pytest  # noqa: E402
+
+from providers import FatalProviderError, Provider  # noqa: E402
+from translator import Cache  # noqa: E402
+
+
+class _OnlyTitleProvider(Provider):
+    """Translates the game title fine but answers the dialogue line in
+    English -- which api_result_problem() rejects as "not Korean"."""
+    id = "fake"
+    label = "가짜 API"
+    batch_size = 10
+    workers = 1
+
+    def translate_batch(self, texts):
+        return ["테스트 게임" if t == "テストゲーム" else "Hello" for t in texts]
+
+
+def _run_mode(tmp_path, monkeypatch, mode, provider):
+    monkeypatch.setattr(OllamaTranslator, "_call_model", lambda self, text: "안녕하세요")
+    game_root = tmp_path / "MyGame"
+    _make_fake_asar_game(game_root)
+    out_dir = tmp_path / "MyGame_KO"
+    cache_path = tmp_path / "cache.json"
+    logs: list[str] = []
+    pipeline.run_all(game=str(game_root), out=str(out_dir), font=None, model="test-model",
+                     cache_path=str(cache_path), log=logs.append, workers=1,
+                     mode=mode, provider=provider)
+    return Cache(str(cache_path)), out_dir, logs
+
+
+def test_hybrid_mode_api_first_then_local_for_rejected_lines(tmp_path, monkeypatch):
+    cache, _, logs = _run_mode(tmp_path, monkeypatch, "hybrid", _OnlyTitleProvider())
+    assert cache.get("テストゲーム") == "테스트 게임"
+    assert cache.get_origin("テストゲーム") == "api:fake"
+    assert cache.get("こんにちは") == "안녕하세요"
+    assert cache.get_origin("こんにちは") == "local:test-model"
+    assert any("한글 없음 1" in line for line in logs), logs
+
+
+def test_api_only_mode_leaves_rejected_lines_for_review(tmp_path, monkeypatch):
+    cache, out_dir, _ = _run_mode(tmp_path, monkeypatch, "api", _OnlyTitleProvider())
+    assert cache.get("テストゲーム") == "테스트 게임"
+    assert cache.get("こんにちは") is None
+    review = json.loads((out_dir / pipeline.REVIEW_FILENAME).read_text(encoding="utf-8"))
+    assert {"source": "こんにちは", "translated": "", "reason": "untranslated",
+            "origin": None} in review
+
+
+class _BadKeyProvider(Provider):
+    id = "fake"
+    label = "가짜 API"
+    workers = 1
+
+    def translate_batch(self, texts):
+        raise FatalProviderError("인증 실패")
+
+
+def test_api_only_mode_fails_loudly_on_fatal_error(tmp_path, monkeypatch):
+    with pytest.raises(RuntimeError, match="인증 실패"):
+        _run_mode(tmp_path, monkeypatch, "api", _BadKeyProvider())
+
+
+def test_hybrid_mode_falls_back_to_local_on_fatal_error(tmp_path, monkeypatch):
+    cache, _, logs = _run_mode(tmp_path, monkeypatch, "hybrid", _BadKeyProvider())
+    assert cache.get_origin("こんにちは") == "local:test-model"
+    assert any("API 사용 중단" in line for line in logs)
+
+
+def test_api_mode_without_required_key_is_rejected_before_touching_files(tmp_path):
+    from providers import DeepL
+    with pytest.raises(RuntimeError, match="API 키"):
+        pipeline.run_all(game=str(tmp_path / "x"), out=str(tmp_path / "y"), font=None,
+                         model="m", cache_path=str(tmp_path / "c.json"), mode="api",
+                         provider=DeepL())
+    assert not (tmp_path / "y").exists()

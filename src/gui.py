@@ -21,14 +21,16 @@ from tkinter import filedialog, messagebox
 
 import customtkinter as ctk
 
+import keystore
 import notify
 import ollama_ctl
 import power
 from engine import detect_project
-from pipeline import REVIEW_FILENAME, run_all
+from pipeline import MODE_LABELS, REVIEW_FILENAME, run_all
+from providers import PROVIDERS, FatalProviderError, ProviderError, create_provider
 from render_patch import build_translation_map, inject_render_patch
 from textwalk import collect_glossary_names, walk_project
-from translator import OllamaTranslator
+from translator import OllamaTranslator, protect_codes, restore_codes
 
 ctk.set_appearance_mode("System")
 ctk.set_default_color_theme("blue")
@@ -70,12 +72,13 @@ class LocalizerGUI:
     def __init__(self, root: ctk.CTk):
         self.root = root
         root.title("쯔꾸르 게임 한국어화 도구")
-        root.geometry("760x600")
-        root.minsize(680, 500)
+        root.geometry("780x720")
+        root.minsize(700, 600)
 
         self.q: "queue.Queue[tuple[str, object]]" = queue.Queue()
         self.worker: threading.Thread | None = None
         self.cancel_flag = False
+        self.settings = keystore.load_settings()
 
         pad = {"padx": 10, "pady": 6}
 
@@ -86,39 +89,58 @@ class LocalizerGUI:
         self.game_var = tk.StringVar()
         self.out_var = tk.StringVar()
         self.font_var = tk.StringVar(value=self._default_font())
-        self.model_var = tk.StringVar(value="hf.co/hell0ks/ja-ko-vn-12b-v2-gguf:Q5_K_M")
-        self.workers_var = tk.StringVar(value="6")
+        self.model_var = tk.StringVar(value=self.settings["local_model"])
+        self.workers_var = tk.StringVar(value=str(self.settings["workers"]))
+        self.mode_var = tk.StringVar(value=MODE_LABELS.get(self.settings["mode"], MODE_LABELS["hybrid"]))
+        provider_id = self.settings["provider"] if self.settings["provider"] in PROVIDERS else "google_free"
+        self.provider_var = tk.StringVar(value=PROVIDERS[provider_id].label)
 
         self._row(frm, 0, "원본 게임 폴더", self.game_var, self._browse_game)
         self._row(frm, 1, "출력 폴더 (새로 생성됨)", self.out_var, self._browse_out)
         self._row(frm, 2, "한국어 폰트 (.ttf)", self.font_var, self._browse_font)
 
-        ctk.CTkLabel(frm, text="번역 모델").grid(row=3, column=0, sticky="w", padx=10, pady=6)
+        ctk.CTkLabel(frm, text="번역 방식").grid(row=3, column=0, sticky="w", padx=10, pady=6)
+        ctk.CTkOptionMenu(frm, variable=self.mode_var, values=list(MODE_LABELS.values()),
+                          width=220, command=lambda _v: self._update_mode_widgets()).grid(
+            row=3, column=1, sticky="w", padx=10, pady=6)
+
+        ctk.CTkLabel(frm, text="API 엔진").grid(row=4, column=0, sticky="w", padx=10, pady=6)
+        self.provider_menu = ctk.CTkOptionMenu(
+            frm, variable=self.provider_var, values=[c.label for c in PROVIDERS.values()], width=360)
+        self.provider_menu.grid(row=4, column=1, sticky="w", padx=10, pady=6)
+        self.api_settings_btn = ctk.CTkButton(frm, text="API 설정...", width=110,
+                                               command=self._open_api_settings)
+        self.api_settings_btn.grid(row=4, column=2, padx=10, pady=6)
+
+        ctk.CTkLabel(frm, text="로컬 모델 (Ollama)").grid(row=5, column=0, sticky="w", padx=10, pady=6)
         self.model_combo = ctk.CTkComboBox(frm, variable=self.model_var, values=FALLBACK_MODELS,
                                             width=360)
-        self.model_combo.grid(row=3, column=1, sticky="we", padx=10, pady=6)
+        self.model_combo.grid(row=5, column=1, sticky="we", padx=10, pady=6)
         self.download_model_btn = ctk.CTkButton(frm, text="모델 다운로드", width=110,
                                                   command=self._download_model)
-        self.download_model_btn.grid(row=3, column=2, padx=10, pady=6)
+        self.download_model_btn.grid(row=5, column=2, padx=10, pady=6)
 
-        ctk.CTkLabel(frm, text="동시 번역 요청 수").grid(row=4, column=0, sticky="w", padx=10, pady=6)
-        ctk.CTkOptionMenu(frm, variable=self.workers_var, values=WORKER_CHOICES,
-                           width=90).grid(row=4, column=1, sticky="w", padx=10, pady=6)
+        ctk.CTkLabel(frm, text="로컬 동시 요청 수").grid(row=6, column=0, sticky="w", padx=10, pady=6)
+        self.workers_menu = ctk.CTkOptionMenu(frm, variable=self.workers_var,
+                                              values=WORKER_CHOICES, width=90)
+        self.workers_menu.grid(row=6, column=1, sticky="w", padx=10, pady=6)
 
         self.hangul_plugin_var = tk.BooleanVar(value=True)
         ctk.CTkCheckBox(frm, text="이름 입력창 한글 지원 플러그인 추가 (게임에 이름 입력이 있을 때)",
                          variable=self.hangul_plugin_var).grid(
-            row=5, column=0, columnspan=3, sticky="w", padx=10, pady=6)
+            row=7, column=0, columnspan=3, sticky="w", padx=10, pady=6)
 
         self.auto_shutdown_var = tk.BooleanVar(value=False)
         ctk.CTkCheckBox(frm, text="완료 후 자동 종료 (검토 항목 없을 때만 - Ollama 끄고 PC 종료)",
                          variable=self.auto_shutdown_var).grid(
-            row=6, column=0, columnspan=3, sticky="w", padx=10, pady=6)
+            row=8, column=0, columnspan=3, sticky="w", padx=10, pady=6)
 
         self.notify_close_var = tk.BooleanVar(value=False)
         ctk.CTkCheckBox(frm, text="완료 후 알림 (검토 항목 없으면 프로그램+Ollama도 종료, PC는 안 끔)",
                          variable=self.notify_close_var).grid(
-            row=7, column=0, columnspan=3, sticky="w", padx=10, pady=6)
+            row=9, column=0, columnspan=3, sticky="w", padx=10, pady=6)
+
+        self._update_mode_widgets()
 
         threading.Thread(target=self._refresh_models, daemon=True).start()
 
@@ -167,6 +189,7 @@ class LocalizerGUI:
         self.result_path: str | None = None
         self.result_model: str | None = None
         self.result_cache_path: str | None = None
+        self.log_file_path: str | None = None
         root.after(100, self._poll_queue)
         root.protocol("WM_DELETE_WINDOW", self._on_close)
 
@@ -213,6 +236,34 @@ class LocalizerGUI:
         path = filedialog.askopenfilename(title="한국어 지원 폰트 선택", filetypes=[("TrueType Font", "*.ttf")])
         if path:
             self.font_var.set(path)
+
+    def _selected_mode(self) -> str:
+        label = self.mode_var.get()
+        return next((k for k, v in MODE_LABELS.items() if v == label), "hybrid")
+
+    def _selected_provider_id(self) -> str:
+        label = self.provider_var.get()
+        return next((pid for pid, c in PROVIDERS.items() if c.label == label), "google_free")
+
+    def _update_mode_widgets(self):
+        mode = self._selected_mode()
+        api_state = "disabled" if mode == "local" else "normal"
+        local_state = "disabled" if mode == "api" else "normal"
+        self.provider_menu.configure(state=api_state)
+        self.api_settings_btn.configure(state=api_state)
+        self.model_combo.configure(state=local_state)
+        self.download_model_btn.configure(state=local_state)
+        self.workers_menu.configure(state=local_state)
+
+    def _open_api_settings(self):
+        ApiSettingsWindow(self.root, self.settings, self._selected_provider_id(), self._log)
+
+    def _save_run_settings(self, mode: str, provider_id: str, model: str, workers: int):
+        self.settings.update(mode=mode, provider=provider_id, local_model=model, workers=workers)
+        try:
+            keystore.save_settings(self.settings)
+        except OSError as e:
+            self._log(f"설정 저장 실패 (번역은 계속합니다): {e}")
 
     def _refresh_models(self):
         models = list_ollama_models()
@@ -380,19 +431,50 @@ class LocalizerGUI:
         deleted and recreated on a retried run."""
         return os.path.abspath(os.path.join(out, "..", os.path.basename(out) + "_translations.json"))
 
+    @staticmethod
+    def _log_path_for(out: str) -> str:
+        """A plain-text mirror of everything that goes into the log box,
+        written live as the run progresses -- so a stall can be inspected
+        (e.g. by reading the file directly) without needing the app window
+        itself or a screenshot."""
+        return os.path.abspath(os.path.join(out, "..", os.path.basename(out) + "_log.txt"))
+
     def _start(self):
         game = self.game_var.get().strip()
         out = self.out_var.get().strip()
         font = self.font_var.get().strip()
         model = self.model_var.get().strip()
+        mode = self._selected_mode()
+        provider_id = self._selected_provider_id()
 
-        if not self._ollama_running:
+        if mode == "local" and not self._ollama_running:
             messagebox.showwarning(
                 "Ollama가 꺼져 있습니다",
-                "번역을 시작하려면 먼저 Ollama를 실행해야 해요.\n"
+                "로컬 번역을 하려면 먼저 Ollama를 실행해야 해요.\n"
                 "위의 'Ollama 시작' 버튼을 눌러 켠 뒤 다시 시도해주세요.",
             )
             return
+        if mode == "hybrid" and not self._ollama_running:
+            if not messagebox.askyesno(
+                "Ollama가 꺼져 있습니다",
+                "Ollama가 꺼져 있어서 API가 놓친 문장을 로컬 모델로 보완할 수 없어요.\n\n"
+                "이번에는 API만으로 진행할까요?\n"
+                "('아니오'를 누르면 취소되고, Ollama를 켠 뒤 다시 시작할 수 있어요.)",
+            ):
+                return
+            mode = "api"
+
+        provider = None
+        if mode != "local":
+            cfg = keystore.provider_config(self.settings, provider_id)
+            provider = create_provider(provider_id, **cfg)
+            try:
+                provider.validate()
+            except FatalProviderError as e:
+                messagebox.showerror("API 설정 필요", str(e))
+                self._open_api_settings()
+                return
+
         if not game:
             messagebox.showerror("오류", "원본 게임 폴더를 선택해주세요.")
             return
@@ -429,20 +511,33 @@ class LocalizerGUI:
         self.result_cache_path = cache_path
         self.review_btn.configure(state="disabled")
 
+        self.log_file_path = self._log_path_for(out)
+        engines = f"로컬 모델: {model}" if provider is None else (
+            f"API: {provider.label}" + ("" if mode == "api" else f", 로컬 모델: {model}"))
+        try:
+            with open(self.log_file_path, "w", encoding="utf-8") as f:
+                f.write(f"=== 번역 시작 {time.strftime('%Y-%m-%d %H:%M:%S')} "
+                        f"({MODE_LABELS[mode]} / {engines}) ===\n")
+        except Exception:  # noqa: BLE001
+            self.log_file_path = None
+
         try:
             workers = max(1, int(self.workers_var.get()))
         except ValueError:
             workers = 4
+        # Remember the choice (not the run-only "api" downgrade for a stopped Ollama).
+        self._save_run_settings(self._selected_mode(), provider_id, model, workers)
 
         self.worker = threading.Thread(
             target=self._run_worker,
             args=(game, out, font or None, model, cache_path, workers,
-                  self.hangul_plugin_var.get()),
+                  self.hangul_plugin_var.get(), mode, provider),
             daemon=True,
         )
         self.worker.start()
 
-    def _run_worker(self, game, out, font, model, cache_path, workers, install_hangul_plugin):
+    def _run_worker(self, game, out, font, model, cache_path, workers, install_hangul_plugin,
+                    mode, provider):
         try:
             def progress(done, total):
                 self.q.put(("progress", (done, max(total, 1))))
@@ -454,6 +549,7 @@ class LocalizerGUI:
                 game=game, out=out, font=font, model=model, cache_path=cache_path,
                 log=self._log, progress=progress, should_cancel=should_cancel,
                 workers=workers, install_hangul_plugin=install_hangul_plugin,
+                mode=mode, provider=provider,
             )
             self.q.put(("done", result))
         except InterruptedError:
@@ -536,6 +632,12 @@ class LocalizerGUI:
         self.log_text.insert("end", msg + "\n")
         self.log_text.see("end")
         self.log_text.configure(state="disabled")
+        if self.log_file_path:
+            try:
+                with open(self.log_file_path, "a", encoding="utf-8") as f:
+                    f.write(msg + "\n")
+            except Exception:  # noqa: BLE001
+                pass  # log file is a debugging aid, never worth failing the run over
 
     def _poll_queue(self):
         try:
@@ -609,7 +711,7 @@ class LocalizerGUI:
         self.root.after(100, self._poll_queue)
 
 
-_REASON_LABELS = {"fallback": "원문 유지", "length": "번역이 김"}
+_REASON_LABELS = {"fallback": "원문 유지", "length": "번역이 김", "untranslated": "번역 안 됨"}
 
 
 class _TermListWindow(ctk.CTkToplevel):
@@ -724,7 +826,7 @@ class _TermListWindow(ctk.CTkToplevel):
             return
         try:
             translator = OllamaTranslator(model=self.model, cache_path=self.cache_path)
-            translator.cache.set(item["source"], new_value)
+            translator.cache.set(item["source"], new_value, origin="manual")
             translator.cache.save()
             self._after_save(item, old_value, new_value)
         except Exception as e:  # noqa: BLE001
@@ -746,7 +848,7 @@ class _TermListWindow(ctk.CTkToplevel):
             try:
                 translator = OllamaTranslator(model=self.model, cache_path=self.cache_path)
                 old_value = item.get("translated", "")
-                translator.cache.data.pop(item["source"], None)
+                translator.cache.delete(item["source"])
                 new_value = translator.translate(item["source"])
                 translator.cache.save()
                 self._after_save(item, old_value, new_value)
@@ -786,8 +888,11 @@ class ReviewWindow(_TermListWindow):
                           cache_path, items, log_fn, show_reason=True)
 
     def _after_save(self, item, old_value, new_value):
+        # An untranslated item (reason "untranslated") has no old translation:
+        # what's actually sitting in the output files is the source text.
+        on_disk = old_value or item["source"]
         layout = detect_project(self.out_path)
-        walk_project(layout, lambda t: new_value if t == old_value else t)
+        walk_project(layout, lambda t: new_value if t == on_disk else t)
         translator = OllamaTranslator(model=self.model, cache_path=self.cache_path)
         translation_map = build_translation_map(translator.cache.data)
         inject_render_patch(layout, translation_map)
@@ -804,6 +909,146 @@ class GlossaryWindow(_TermListWindow):
     def __init__(self, parent, model: str, cache_path: str, items: list[dict], log_fn):
         super().__init__(parent, f"용어집 ({len(items)}개)", "용어집", model,
                           cache_path, items, log_fn, show_reason=False)
+
+
+class ApiSettingsWindow(ctk.CTkToplevel):
+    """Key / model / address for one API engine. The key is written only
+    through keystore (DPAPI-encrypted) and never goes to the log."""
+
+    _TEST_TEXT = "\\N[1]さん、こんにちは。元気ですか？"
+
+    def __init__(self, parent, settings: dict, provider_id: str, log_fn):
+        super().__init__(parent)
+        self.settings = settings
+        self.provider_id = provider_id
+        self.cls = PROVIDERS[provider_id]
+        self.log_fn = log_fn
+        self.title(f"API 설정 - {self.cls.label}")
+        self.geometry("600x420")
+        self.after(150, self.lift)
+
+        cfg = keystore.provider_config(settings, provider_id)
+        body = ctk.CTkFrame(self, fg_color="transparent")
+        body.pack(fill="both", expand=True, padx=14, pady=12)
+        body.columnconfigure(1, weight=1)
+
+        ctk.CTkLabel(body, text=self.cls.label, font=ctk.CTkFont(size=15, weight="bold")).grid(
+            row=0, column=0, columnspan=3, sticky="w")
+        ctk.CTkLabel(body, text=self.cls.note, wraplength=560, justify="left").grid(
+            row=1, column=0, columnspan=3, sticky="w", pady=(4, 10))
+
+        row = 2
+        self.key_entry = None
+        if self.cls.needs_key or self.cls.needs_base_url:
+            label = "API 키" if self.cls.needs_key else "API 키 (선택)"
+            ctk.CTkLabel(body, text=label).grid(row=row, column=0, sticky="w", pady=4)
+            self.key_entry = ctk.CTkEntry(body, show="•")
+            self.key_entry.grid(row=row, column=1, sticky="we", padx=8, pady=4)
+            if cfg["key"]:
+                self.key_entry.insert(0, cfg["key"])
+            self.show_key_var = tk.BooleanVar(value=False)
+            ctk.CTkCheckBox(body, text="보기", width=60, variable=self.show_key_var,
+                            command=self._toggle_key).grid(row=row, column=2, pady=4)
+            row += 1
+
+        self.model_entry = None
+        if self.cls.is_llm:
+            ctk.CTkLabel(body, text="모델 이름").grid(row=row, column=0, sticky="w", pady=4)
+            self.model_entry = ctk.CTkEntry(body, placeholder_text=self.cls.model_hint)
+            self.model_entry.grid(row=row, column=1, columnspan=2, sticky="we", padx=8, pady=4)
+            model = cfg["model"] or self.cls.default_model
+            if model:
+                self.model_entry.insert(0, model)
+            row += 1
+
+        self.url_entry = None
+        if self.cls.needs_base_url:
+            ctk.CTkLabel(body, text="주소").grid(row=row, column=0, sticky="w", pady=4)
+            self.url_entry = ctk.CTkEntry(body, placeholder_text=self.cls.default_base_url)
+            self.url_entry.grid(row=row, column=1, columnspan=2, sticky="we", padx=8, pady=4)
+            self.url_entry.insert(0, cfg["base_url"] or self.cls.default_base_url)
+            row += 1
+
+        if not (self.cls.needs_key or self.cls.is_llm or self.cls.needs_base_url):
+            ctk.CTkLabel(body, text="이 엔진은 따로 설정할 것이 없습니다. 바로 쓸 수 있어요.").grid(
+                row=row, column=0, columnspan=3, sticky="w", pady=4)
+            row += 1
+
+        ctk.CTkLabel(body, text="키는 이 컴퓨터의 Windows 계정으로 암호화해서 저장합니다 "
+                                "(다른 PC나 계정에서는 풀 수 없음).",
+                     text_color=("gray40", "gray65"), wraplength=560, justify="left").grid(
+            row=row, column=0, columnspan=3, sticky="w", pady=(8, 4))
+        row += 1
+
+        self.result_var = tk.StringVar(value="")
+        ctk.CTkLabel(body, textvariable=self.result_var, wraplength=560, justify="left").grid(
+            row=row, column=0, columnspan=3, sticky="w", pady=6)
+        row += 1
+
+        btns = ctk.CTkFrame(body, fg_color="transparent")
+        btns.grid(row=row, column=0, columnspan=3, sticky="we", pady=(8, 0))
+        self.test_btn = ctk.CTkButton(btns, text="연결 테스트", width=110, command=self._test)
+        self.test_btn.pack(side="left", padx=4)
+        ctk.CTkButton(btns, text="저장", width=90, command=self._save).pack(side="left", padx=4)
+        if self.key_entry is not None:
+            ctk.CTkButton(btns, text="키 삭제", width=90, fg_color="#a83232", hover_color="#8a2828",
+                          command=self._delete_key).pack(side="left", padx=4)
+        ctk.CTkButton(btns, text="닫기", width=90, fg_color="#555", hover_color="#444",
+                      command=self.destroy).pack(side="right", padx=4)
+
+    def _toggle_key(self):
+        self.key_entry.configure(show="" if self.show_key_var.get() else "•")
+
+    def _values(self) -> tuple[str, str, str]:
+        key = self.key_entry.get().strip() if self.key_entry is not None else ""
+        model = self.model_entry.get().strip() if self.model_entry is not None else ""
+        url = self.url_entry.get().strip() if self.url_entry is not None else ""
+        return key, model, url
+
+    def _save(self):
+        key, model, url = self._values()
+        try:
+            keystore.set_provider_config(self.settings, self.provider_id, key, model, url)
+            keystore.save_settings(self.settings)
+        except OSError as e:
+            messagebox.showerror("저장 실패", f"설정을 저장하지 못했습니다:\n{e}", parent=self)
+            return
+        self.result_var.set("저장했습니다.")
+        self.log_fn(f"API 설정 저장됨: {self.cls.label}")
+
+    def _delete_key(self):
+        if not messagebox.askyesno("키 삭제", "저장된 API 키를 지울까요?", parent=self):
+            return
+        self.key_entry.delete(0, "end")
+        _key, model, url = self._values()
+        keystore.set_provider_config(self.settings, self.provider_id, "", model, url)
+        keystore.save_settings(self.settings)
+        self.result_var.set("키를 삭제했습니다.")
+
+    def _test(self):
+        key, model, url = self._values()
+        provider = create_provider(self.provider_id, key, model, url)
+        self.test_btn.configure(state="disabled")
+        self.result_var.set("테스트 중...")
+
+        def run():
+            protected, mapping = protect_codes(self._TEST_TEXT)
+            try:
+                provider.validate()
+                out = restore_codes(provider.translate_batch([protected])[0], mapping)
+                msg = f"성공: {self._TEST_TEXT}  →  {out}"
+            except (FatalProviderError, ProviderError) as e:
+                msg = f"실패: {e}"
+            except Exception as e:  # noqa: BLE001
+                msg = f"실패: {type(e).__name__}: {e}"
+            self.after(0, self._test_done, msg)
+
+        threading.Thread(target=run, daemon=True).start()
+
+    def _test_done(self, msg: str):
+        if self.winfo_exists():
+            self.test_btn.configure(state="normal")
+            self.result_var.set(msg)
 
 
 def main():

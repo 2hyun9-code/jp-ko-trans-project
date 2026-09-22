@@ -21,8 +21,10 @@ if sys.stdout.encoding and sys.stdout.encoding.lower() != "utf-8":
     sys.stdout.reconfigure(encoding="utf-8")
     sys.stderr.reconfigure(encoding="utf-8")
 
+import keystore
 from engine import detect_project, copy_project
 from fonts import swap_font
+from providers import PROVIDERS, create_provider
 from textwalk import walk_project
 from translator import OllamaTranslator
 from pipeline import run_all
@@ -101,6 +103,11 @@ def cmd_inject(args):
 
 
 def cmd_all(args):
+    provider = None
+    if args.mode != "local":
+        # Key/model/address come from the GUI's encrypted settings (API 설정).
+        settings = keystore.load_settings()
+        provider = create_provider(args.provider, **keystore.provider_config(settings, args.provider))
     run_all(
         game=args.game,
         out=args.out,
@@ -110,6 +117,8 @@ def cmd_all(args):
         log=print,
         workers=args.workers,
         install_hangul_plugin=not args.no_hangul_plugin,
+        mode=args.mode,
+        provider=provider,
     )
 
 
@@ -152,6 +161,10 @@ def main():
     p.add_argument("--workers", type=int, default=4, help="동시에 보낼 번역 요청 수")
     p.add_argument("--no-hangul-plugin", action="store_true",
                    help="이름 입력창 한글 지원 플러그인을 추가하지 않음")
+    p.add_argument("--mode", choices=["local", "api", "hybrid"], default="local",
+                   help="local: 로컬 모델만 / api: API만 / hybrid: API 우선 + 로컬 보완")
+    p.add_argument("--provider", choices=sorted(PROVIDERS), default="google_free",
+                   help="API 엔진 (키 등은 GUI의 'API 설정'에서 저장한 값을 씀)")
     p.set_defaults(func=cmd_all)
 
     args = parser.parse_args()

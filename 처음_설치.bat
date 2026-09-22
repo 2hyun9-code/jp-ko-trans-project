@@ -123,7 +123,7 @@ where python >nul 2>nul
 if errorlevel 1 goto need_python
 
 echo [빌드] 필요한 패키지를 설치합니다 (처음 한 번만, 몇 분 걸릴 수 있습니다)...
-python -m pip install --user --quiet pyinstaller customtkinter fonttools brotli requests
+python -m pip install --user --quiet pyinstaller customtkinter fonttools brotli requests anthropic
 if errorlevel 1 goto pip_failed
 
 pushd src

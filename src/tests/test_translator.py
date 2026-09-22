@@ -13,6 +13,7 @@ from translator import (  # noqa: E402
     _looks_translated,
     _num_predict_for,
     _options_for_model,
+    api_result_problem,
     collapse_repeated_chars,
     flag_reason,
     protect_codes,
@@ -194,7 +195,51 @@ def test_cache_round_trip(tmp_path):
     assert reloaded.get("hello") == "안녕"
 
     on_disk = json.loads(path.read_text(encoding="utf-8"))
-    assert on_disk == {"hello": "안녕"}
+    assert on_disk == {"format": 2, "translations": {"hello": "안녕"}, "origin": {}}
+
+
+def test_cache_reads_old_flat_format_and_upgrades_on_save(tmp_path):
+    path = tmp_path / "cache.json"
+    path.write_text(json.dumps({"こんにちは": "안녕하세요"}, ensure_ascii=False), encoding="utf-8")
+
+    cache = Cache(str(path))
+    assert cache.get("こんにちは") == "안녕하세요"
+    assert cache.get_origin("こんにちは") is None
+
+    cache.set("さようなら", "잘 가", origin="api:deepl")
+    cache.save()
+    on_disk = json.loads(path.read_text(encoding="utf-8"))
+    assert on_disk["format"] == 2
+    assert on_disk["translations"] == {"こんにちは": "안녕하세요", "さようなら": "잘 가"}
+    assert on_disk["origin"] == {"さようなら": "api:deepl"}
+
+
+def test_cache_set_without_origin_clears_stale_origin(tmp_path):
+    cache = Cache(str(tmp_path / "c.json"))
+    cache.set("a", "가", origin="api:deepl")
+    cache.set("a", "나")  # e.g. edited by hand through an older code path
+    assert cache.get_origin("a") is None
+
+
+def test_api_result_problem_accepts_clean_translation():
+    protected, mapping = protect_codes("\\N[1]、こんにちは")
+    assert api_result_problem(protected, "__T0__, 안녕하세요", mapping) is None
+
+
+def test_api_result_problem_flags_each_failure_kind():
+    protected, mapping = protect_codes("\\N[1]、こんにちは")
+    assert api_result_problem(protected, "안녕하세요", mapping) == "code_lost"
+    assert api_result_problem("こんにちは", "Hello", {}) == "not_korean"
+    assert api_result_problem("アリスさん", "アリス 씨", {}) == "japanese_left"
+    assert api_result_problem("こんにちは", "안녕 тест", {}) == "foreign"
+    assert api_result_problem("こんにちは", "죄송하지만 그 요청은 번역할 수 없습니다.", {}) == "odd"
+
+
+def test_api_result_problem_does_not_flag_everyday_words():
+    # "위해" is in the local path's meta-phrase list but is ordinary dialogue.
+    assert api_result_problem("世界のために戦う", "세계를 위해 싸운다", {}) is None
+    # A plain apology is a normal translation, not a refusal.
+    assert api_result_problem("すみません", "죄송합니다", {}) is None
 
 
 def test_translate_logs_slow_response(tmp_path, monkeypatch):
