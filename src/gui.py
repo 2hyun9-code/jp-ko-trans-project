@@ -810,6 +810,13 @@ def main():
     root = ctk.CTk()
     LocalizerGUI(root)
     root.mainloop()
+    # mainloop() returning means the window is gone, but daemon threads
+    # (ollama status polling, a translation worker, ...) or the PyInstaller
+    # onefile bootloader's parent/child pair have occasionally been seen to
+    # keep the process itself alive after that. Hard-exit rather than fall
+    # through to Python's normal interpreter shutdown, which waits on
+    # whatever is still lingering.
+    os._exit(0)
 
 
 if __name__ == "__main__":

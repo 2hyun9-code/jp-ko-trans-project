@@ -4,8 +4,10 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+import translator  # noqa: E402
 from translator import (  # noqa: E402
     Cache,
+    OllamaTranslator,
     _has_foreign_leakage,
     _looks_like_leaked_explanation,
     _looks_translated,
@@ -193,3 +195,35 @@ def test_cache_round_trip(tmp_path):
 
     on_disk = json.loads(path.read_text(encoding="utf-8"))
     assert on_disk == {"hello": "안녕"}
+
+
+def test_translate_logs_slow_response(tmp_path, monkeypatch):
+    monkeypatch.setattr(translator, "_SLOW_RESPONSE_SEC", 0.0)
+    times = iter([0.0, 1.0])  # start, then elapsed 1.0s -- always "slow" here
+    monkeypatch.setattr(translator.time, "monotonic", lambda: next(times))
+
+    logged = []
+    t = OllamaTranslator(model="qwen2.5:14b-instruct",
+                          cache_path=str(tmp_path / "cache.json"),
+                          log=logged.append)
+    monkeypatch.setattr(t, "_call_model", lambda prompt: "안녕하세요")
+
+    result = t.translate("こんにちは")
+    assert result == "안녕하세요"
+    assert len(logged) == 1
+    assert "느린 응답" in logged[0]
+    assert "こんにちは" in logged[0]
+
+
+def test_translate_no_log_when_fast(tmp_path, monkeypatch):
+    times = iter([0.0, 0.01])
+    monkeypatch.setattr(translator.time, "monotonic", lambda: next(times))
+
+    logged = []
+    t = OllamaTranslator(model="qwen2.5:14b-instruct",
+                          cache_path=str(tmp_path / "cache.json"),
+                          log=logged.append)
+    monkeypatch.setattr(t, "_call_model", lambda prompt: "안녕하세요")
+
+    t.translate("こんにちは")
+    assert logged == []

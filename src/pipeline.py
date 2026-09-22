@@ -120,7 +120,7 @@ def run_all(
         if msg:
             log(msg)
 
-    translator = OllamaTranslator(model=model, cache_path=cache_path)
+    translator = OllamaTranslator(model=model, cache_path=cache_path, log=log)
 
     # Pass 1: translate proper nouns (actor names, name-box speaker names)
     # first, then feed them back as a glossary so the same name comes out

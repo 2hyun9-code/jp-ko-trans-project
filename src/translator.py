@@ -232,14 +232,22 @@ class Cache:
         )
 
 
+_SLOW_RESPONSE_SEC = 20.0
+
+
 class OllamaTranslator:
     def __init__(self, model: str, cache_path: str, retries: int = 3,
-                 translate_attempts: int = 3):
+                 translate_attempts: int = 3, log=None):
         self.model = model
         self.cache = Cache(cache_path)
         self.retries = retries  # HTTP-level retries (network/connection failures)
         self.translate_attempts = translate_attempts  # quality-check retries
         self._glossary_block = ""
+        # Optional callback(str) -> None. Used only to surface individual
+        # slow requests (see translate()) so a stall shows up in the log
+        # with which text and how long, instead of just silently sitting
+        # there with no clue what the GPU is stuck on.
+        self._log = log or (lambda _msg: None)
 
     def set_glossary(self, glossary: dict[str, str]) -> None:
         """Names/proper nouns translated once up front, fed back into every
@@ -271,7 +279,14 @@ class OllamaTranslator:
         prompt = protected
         candidate = ""
         for attempt in range(self.translate_attempts):
-            candidate = collapse_repeated_chars(strip_template_artifacts(self._call_model(prompt)))
+            start = time.monotonic()
+            raw = self._call_model(prompt)
+            elapsed = time.monotonic() - start
+            if elapsed >= _SLOW_RESPONSE_SEC:
+                preview = text if len(text) <= 40 else text[:40] + "..."
+                self._log(f"  느린 응답: {elapsed:.0f}초 걸림 (시도 {attempt + 1}/"
+                           f"{self.translate_attempts}, 텍스트: {preview!r})")
+            candidate = collapse_repeated_chars(strip_template_artifacts(raw))
             if not _is_bad_translation(protected, candidate):
                 break
             # Sharpen the nudge each retry based on what's actually wrong,
