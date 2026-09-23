@@ -13,10 +13,16 @@ import requests
 
 OLLAMA_URL = "http://localhost:11434/api/chat"
 
-# RPG Maker text codes we must not let the LLM touch: \N[1], \V[2], \C[3],
-# \I[4], \P[5], \G, \\, \{, \}, \., \|, \!, \>, \<, \^, \$
+# Engine markup the translator must not touch.
+# RPG Maker: \N[1], \V[2], \C[3], \I[4], \P[5], \G, \\, \{, \}, \., \|, \!, \>, \<, \^, \$
+# Ren'Py: text tags ({b}, {/b}, {w}, {w=0.5}, {color=#f00}, {{ escape) and
+# interpolation ([player_name], [p.name!c], [[ escape), %(name)s formatting.
+# The Ren'Py shapes need an ASCII identifier inside the brackets, so a
+# decorative 「[重要]」 in game text is left alone and still gets translated.
 _CODE_RE = re.compile(
-    r"\\[NVCIPG]\[\d+\]|\\[GgSs\\{}\.\|!><\^\$]",
+    r"\\[NVCIPG]\[\d+\]|\\[GgSs\\{}\.\|!><\^\$]"
+    r"|\{\{|\[\[|\{/?[A-Za-z_]+(?:=[^{}]*)?\}|\[[A-Za-z_][\w.]*(?:![a-z]+)?\]"
+    r"|%\([A-Za-z_]\w*\)[sdifr]",
     re.IGNORECASE,
 )
 

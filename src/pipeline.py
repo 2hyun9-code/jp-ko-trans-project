@@ -18,6 +18,7 @@ from fonts import swap_font
 from plugin_install import install_hangul_name_plugin
 from plugin_text import collect_plugin_strings
 from render_patch import build_translation_map, inject_render_patch
+import renpy_engine
 from providers import FatalProviderError, Provider, run_api_pass
 from refindex import build_reference_index
 from review import REVIEW_FILENAME, review_items, write_meta
@@ -142,6 +143,88 @@ def _translate_texts(
         log(f"  {label}: API로 번역하지 못한 {len(remaining)}개는 원문 그대로 두고 검토 목록에 올립니다.")
 
 
+def _log_mode(log: LogFn, mode: str, provider: Optional[Provider], model: str) -> None:
+    engine_desc = f"로컬 모델: {model}" if provider is None else (
+        f"API: {provider.label}" + ("" if mode == "api" else f", 로컬 모델: {model}"))
+    log(f"번역 방식: {MODE_LABELS[mode]} ({engine_desc})")
+
+
+def _glossary_pass(names: list[str], translator: OllamaTranslator, provider: Optional[Provider],
+                   mode: str, workers: int, log: LogFn,
+                   should_cancel: Optional[Callable[[], bool]]) -> None:
+    """Translates proper nouns (character/actor names, ...) first and feeds
+    them back as a glossary, so the same name comes out the same everywhere
+    it appears inside a sentence later."""
+    todo = [n for n in names if translator.cache.get(n) is None]
+    if todo:
+        log(f"고유명사 {len(names)}개 중 {len(todo)}개를 먼저 번역해 용어집을 만듭니다.")
+        _translate_texts(todo, translator, provider, mode, workers, log, None,
+                         should_cancel, "용어집")
+    glossary = {n: t for n in names if (t := translator.cache.get(n))}
+    translator.set_glossary(glossary)
+    if provider is not None:
+        provider.set_glossary(glossary)
+
+
+def _finish_review(game_root: Path, texts: list[str], translator: OllamaTranslator, log: LogFn,
+                   **meta) -> None:
+    """Writes the post-run review list (fallbacks, suspiciously long lines,
+    untranslated ones) and the meta file the review window re-opens later."""
+    flagged = review_items(texts, translator.cache)
+    write_meta(game_root, texts=texts, **meta)
+    review_path = game_root / REVIEW_FILENAME
+    review_path.write_text(json.dumps(flagged, ensure_ascii=False, indent=2), encoding="utf-8")
+    if flagged:
+        fallback_n = sum(1 for f in flagged if f["reason"] == "fallback")
+        length_n = sum(1 for f in flagged if f["reason"] == "length")
+        untranslated_n = sum(1 for f in flagged if f["reason"] == "untranslated")
+        log(f"검토가 필요한 항목 {len(flagged)}개 (원문 유지 {fallback_n}개, "
+            f"번역이 원문보다 많이 김 {length_n}개, 번역 안 됨 {untranslated_n}개) "
+            f"-> {review_path.name}")
+    else:
+        log("검토가 필요한 항목 없음.")
+
+
+def _run_renpy(src_layout, game: str, out: str, font: Optional[str], model: str,
+               cache_path: str, log: LogFn, progress: Optional[ProgressFn],
+               should_cancel: Optional[Callable[[], bool]], workers: int, mode: str,
+               provider: Optional[Provider]) -> str:
+    """Ren'Py: nothing in the game is rewritten -- the translation is wired
+    in through Ren'Py's own text hooks (see renpy_engine.py)."""
+    out_layout = copy_project(src_layout, out)
+    log(f"게임 복사본 생성: {out_layout.root}")
+    game_dir = out_layout.root / "game"
+    ext = renpy_engine.extract(game_dir)
+    read = ", ".join(f"{kind} {n}개" for kind, n in sorted(ext.sources.items())) or "없음"
+    log(f"Ren'Py 스크립트 읽음 ({read}): 번역할 텍스트 {len(ext.texts)}개, "
+        f"캐릭터 이름 {len(ext.names)}개")
+    if not ext.texts:
+        raise RuntimeError("번역할 일본어 텍스트를 찾지 못했습니다. 스크립트가 암호화됐거나 "
+                           "지원하지 않는 형식일 수 있어요.")
+
+    translator = OllamaTranslator(model=model, cache_path=cache_path, log=log)
+    _log_mode(log, mode, provider, model)
+    _glossary_pass(ext.names, translator, provider, mode, workers, log, should_cancel)
+
+    todo = [t for t in ext.texts if translator.cache.get(t) is None]
+    log(f"총 {len(ext.texts)}개 고유 텍스트, 이 중 {len(todo)}개 새로 번역합니다.")
+    _translate_texts(todo, translator, provider, mode, workers, log, progress, should_cancel,
+                     "본문")
+
+    translations = {t: v for t in ext.texts if (v := translator.cache.get(t)) and v != t}
+    written = renpy_engine.apply(game_dir, translations, font, ext.fonts)
+    log(f"번역 {len(translations)}개를 Ren'Py 훅으로 연결했습니다 (게임 원래 파일은 그대로, "
+        f"추가한 파일: {', '.join(p.name for p in written)}).")
+    if not font:
+        log("한국어 폰트 파일 미지정: 게임 폰트에 한글이 없으면 □로 보일 수 있어요.")
+
+    _finish_review(out_layout.root, ext.texts, translator, log, engine="RENPY", game=game,
+                   cache_path=cache_path, local_model=model, guarded=set(),
+                   glossary_names=ext.names)
+    log(f"완료! 한국어화된 게임: {out_layout.root}")
+    return str(out_layout.root)
+
+
 def run_all(
     game: str,
     out: str,
@@ -175,6 +258,9 @@ def run_all(
 
     src_layout = detect_project(game)
     log(f"엔진 감지: {src_layout.engine} ({src_layout.root})")
+    if src_layout.engine == "RENPY":
+        return _run_renpy(src_layout, game, out, font, model, cache_path, log, progress,
+                          should_cancel, workers, mode, provider)
 
     out_layout = copy_project(src_layout, out)
     log(f"게임 복사본 생성: {out_layout.root}")
@@ -206,24 +292,9 @@ def run_all(
             log(msg)
 
     translator = OllamaTranslator(model=model, cache_path=cache_path, log=log)
-    engine_desc = f"로컬 모델: {model}" if provider is None else (
-        f"API: {provider.label}" + ("" if mode == "api" else f", 로컬 모델: {model}"))
-    log(f"번역 방식: {MODE_LABELS[mode]} ({engine_desc})")
-
-    # Pass 1: translate proper nouns (actor names, name-box speaker names)
-    # first, then feed them back as a glossary so the same name comes out
-    # consistently even when it's embedded inside a full sentence later.
+    _log_mode(log, mode, provider, model)
     glossary_names = sorted(collect_glossary_names(out_layout))
-    glossary_todo = [n for n in glossary_names if translator.cache.get(n) is None]
-    if glossary_todo:
-        log(f"고유명사 {len(glossary_names)}개 중 {len(glossary_todo)}개를 먼저 번역해 "
-            f"용어집을 만듭니다.")
-        _translate_texts(glossary_todo, translator, provider, mode, workers, log, None,
-                         should_cancel, "용어집")
-    glossary = {n: t for n in glossary_names if (t := translator.cache.get(n))}
-    translator.set_glossary(glossary)
-    if provider is not None:
-        provider.set_glossary(glossary)
+    _glossary_pass(glossary_names, translator, provider, mode, workers, log, should_cancel)
 
     # Pass 2: everything else, now with the glossary steering embedded mentions.
     texts: list[str] = []
@@ -299,26 +370,9 @@ def run_all(
     else:
         log("index.html을 찾지 못해 화면 출력 시점 패치는 건너뜁니다.")
 
-    # Post-run review list: entries that fell back to the source text after
-    # every retry, came out suspiciously long (message-box overflow risk),
-    # or never got translated at all (API-only mode, API failed on them).
-    flagged = review_items(unique, translator.cache)
-    # What the review window needs to re-open this output later: the game's
-    # own text list (the cache can hold stale keys), the guarded names, and
-    # the glossary names for consistent re-translation.
-    write_meta(game_root, game=game, cache_path=cache_path, local_model=model, texts=unique,
-               guarded=guarded, glossary_names=glossary_names)
-    review_path = game_root / REVIEW_FILENAME
-    review_path.write_text(json.dumps(flagged, ensure_ascii=False, indent=2), encoding="utf-8")
-    if flagged:
-        fallback_n = sum(1 for f in flagged if f["reason"] == "fallback")
-        length_n = sum(1 for f in flagged if f["reason"] == "length")
-        untranslated_n = sum(1 for f in flagged if f["reason"] == "untranslated")
-        log(f"검토가 필요한 항목 {len(flagged)}개 (원문 유지 {fallback_n}개, "
-            f"번역이 원문보다 많이 김 {length_n}개, 번역 안 됨 {untranslated_n}개) "
-            f"-> {review_path.name}")
-    else:
-        log("검토가 필요한 항목 없음.")
+    _finish_review(game_root, unique, translator, log, engine="RPGMAKER", game=game,
+                   cache_path=cache_path, local_model=model, guarded=guarded,
+                   glossary_names=glossary_names)
 
     log(f"완료! 한국어화된 게임: {game_root}")
     return str(game_root)

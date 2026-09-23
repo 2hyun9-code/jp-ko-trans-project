@@ -1,4 +1,4 @@
-"""RPG Maker MV/MZ project detection and layout helpers."""
+"""Game project detection (RPG Maker MV/MZ, Ren'Py) and layout helpers."""
 from __future__ import annotations
 
 import shutil
@@ -14,7 +14,7 @@ class ProjectLayout:
     data_dir: Optional[Path]       # folder containing Map001.json, System.json, etc.
     fonts_dir: Optional[Path]      # folder containing font files
     css_dir: Optional[Path]        # folder containing gamefont.css (MZ) if present
-    engine: str                    # "MV", "MZ", or "MZ-ASAR" (packed, needs extraction first)
+    engine: str                    # "MV", "MZ", "MZ-ASAR" (packed, needs extraction first), "RENPY"
     launch_root: Path = field(default=None)  # top-level folder holding the .exe / runtime
 
     def __post_init__(self):
@@ -95,10 +95,39 @@ def detect_project(game_folder: str) -> ProjectLayout:
         return ProjectLayout(root=root, data_dir=None, fonts_dir=None, css_dir=None,
                               engine="MZ-ASAR", launch_root=root)
 
+    renpy_root = find_renpy_root(root)
+    if renpy_root is not None:
+        return ProjectLayout(root=renpy_root, data_dir=None, fonts_dir=None, css_dir=None,
+                              engine="RENPY", launch_root=renpy_root)
+
     raise ValueError(
-        "RPG Maker MV/MZ 프로젝트가 아닌 것 같습니다 (data/System.json을 찾지 못했습니다). "
-        "VX Ace나 2000/2003 포맷은 아직 지원하지 않습니다."
+        "지원하는 게임 형식이 아닌 것 같습니다 (RPG Maker MV/MZ의 data/System.json이나 "
+        "Ren'Py의 game 폴더를 찾지 못했습니다). RPG Maker VX Ace, 2000/2003은 아직 "
+        "지원하지 않습니다."
     )
+
+
+def _is_renpy_game_dir(game: Path) -> bool:
+    if not game.is_dir():
+        return False
+    return any(any(game.glob(pattern)) for pattern in ("*.rpa", "*.rpyc", "*.rpy"))
+
+
+def find_renpy_root(root: Path) -> Optional[Path]:
+    """The folder holding a Ren'Py game's `game/` directory (and its exe):
+    `root` itself, its parent if the user picked `game/` directly, or one
+    folder down for a bundle that wraps the game in an extra directory."""
+    if root.name.lower() == "game" and _is_renpy_game_dir(root):
+        return root.parent
+    candidates = [root]
+    try:
+        candidates += [p for p in root.iterdir() if p.is_dir() and p.name not in _SKIP_DIR_NAMES]
+    except (PermissionError, OSError):
+        pass
+    for cand in candidates:
+        if _is_renpy_game_dir(cand / "game"):
+            return cand
+    return None
 
 
 def copy_project(layout: ProjectLayout, out_root: str) -> ProjectLayout:

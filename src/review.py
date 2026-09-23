@@ -16,6 +16,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Optional
 
+import renpy_engine
 from engine import detect_project
 from providers import PROVIDERS
 from render_patch import build_translation_map, inject_render_patch
@@ -75,10 +76,11 @@ def _reason_for(src: str, translated: Optional[str]) -> Optional[str]:
     return flag_reason(src, translated)
 
 
-def write_meta(game_root: Path, *, game: str, cache_path: str, local_model: str,
+def write_meta(game_root: Path, *, engine: str, game: str, cache_path: str, local_model: str,
                texts: list[str], guarded: set[str], glossary_names: list[str]) -> None:
-    meta = {"format": 1, "game": game, "cache_path": cache_path, "local_model": local_model,
-            "texts": texts, "guarded": sorted(guarded), "glossary_names": glossary_names}
+    meta = {"format": 1, "engine": engine, "game": game, "cache_path": cache_path,
+            "local_model": local_model, "texts": texts, "guarded": sorted(guarded),
+            "glossary_names": glossary_names}
     (game_root / META_FILENAME).write_text(json.dumps(meta, ensure_ascii=False), encoding="utf-8")
 
 
@@ -98,6 +100,7 @@ class ReviewSession:
     guarded: set[str] = field(default_factory=set)
     glossary_names: list[str] = field(default_factory=list)
     local_model: str = ""
+    engine: str = "RPGMAKER"
 
 
 def open_session(out_path: str, cache_path: str) -> ReviewSession:
@@ -117,6 +120,8 @@ def open_session(out_path: str, cache_path: str) -> ReviewSession:
         guarded=set(meta.get("guarded") or []),
         glossary_names=meta.get("glossary_names") or [],
         local_model=meta.get("local_model") or "",
+        engine=meta.get("engine") or ("RENPY" if (root / "game" / renpy_engine.HOOK_FILE).exists()
+                                      else "RPGMAKER"),
     )
 
 
@@ -216,22 +221,30 @@ def apply_changes(session: ReviewSession, changes: dict[str, Optional[str]]) -> 
 
     Output files hold translations, not sources, so the swap is by the old
     on-disk text: two different sources that had the identical translation
-    both get the new one."""
-    layout = detect_project(str(session.out_path))
-    swap: dict[str, str] = {}
+    both get the new one.
+
+    Ren'Py output keeps the game's files untouched, so there the whole
+    translation map file is simply regenerated from the cache."""
     written = 0
-    for src, old in changes.items():
-        new = session.cache.get(src)
-        if not new or src in session.guarded:
-            continue
-        on_disk = old or src
-        swap[on_disk] = new
-        # Message paragraphs reach the walker without trailing blank lines.
-        swap.setdefault(on_disk.rstrip("\n"), new)
-        written += 1
-    if swap:
-        walk_project(layout, lambda t: swap.get(t, t))
-    inject_render_patch(layout, build_translation_map(session.cache.data))
+    if session.engine == "RENPY":
+        translations = {t: v for t in session.texts if (v := session.cache.get(t)) and v != t}
+        renpy_engine.write_translation(session.out_path / "game", translations)
+        written = sum(1 for src in changes if src in translations)
+    else:
+        layout = detect_project(str(session.out_path))
+        swap: dict[str, str] = {}
+        for src, old in changes.items():
+            new = session.cache.get(src)
+            if not new or src in session.guarded:
+                continue
+            on_disk = old or src
+            swap[on_disk] = new
+            # Message paragraphs reach the walker without trailing blank lines.
+            swap.setdefault(on_disk.rstrip("\n"), new)
+            written += 1
+        if swap:
+            walk_project(layout, lambda t: swap.get(t, t))
+        inject_render_patch(layout, build_translation_map(session.cache.data))
 
     for src in changes:
         reason = _reason_for(src, session.cache.get(src))

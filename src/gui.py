@@ -1,4 +1,4 @@
-"""Desktop GUI for the RPG Maker MV/MZ -> Korean localizer.
+"""Desktop GUI for the Japanese -> Korean game localizer (RPG Maker MV/MZ, Ren'Py).
 
 Wraps pipeline.run_all() in a background thread so the window stays
 responsive, and streams its log/progress into the window via a queue.
@@ -25,6 +25,7 @@ import keystore
 import notify
 import ollama_ctl
 import power
+import renpy_engine
 import review
 from engine import detect_project
 from pipeline import MODE_LABELS, REVIEW_FILENAME, run_all
@@ -126,7 +127,7 @@ class LocalizerGUI:
         self.workers_menu.grid(row=6, column=1, sticky="w", padx=10, pady=6)
 
         self.hangul_plugin_var = tk.BooleanVar(value=True)
-        ctk.CTkCheckBox(frm, text="이름 입력창 한글 지원 플러그인 추가 (게임에 이름 입력이 있을 때)",
+        ctk.CTkCheckBox(frm, text="이름 입력창 한글 지원 플러그인 추가 (RPG Maker, 게임에 이름 입력이 있을 때)",
                          variable=self.hangul_plugin_var).grid(
             row=7, column=0, columnspan=3, sticky="w", padx=10, pady=6)
 
@@ -219,7 +220,7 @@ class LocalizerGUI:
                        command=browse_cmd).grid(row=row, column=2, padx=10, pady=6)
 
     def _browse_game(self):
-        path = filedialog.askdirectory(title="원본 게임 폴더 선택 (package.json 또는 www 폴더가 있는 곳)")
+        path = filedialog.askdirectory(title="원본 게임 폴더 선택 (게임 exe가 있는 폴더)")
         if path:
             self.game_var.set(path)
             if not self.out_var.get():
@@ -620,7 +621,10 @@ class LocalizerGUI:
             return
         try:
             layout = detect_project(game)
-            names = collect_glossary_names(layout)
+            if layout.engine == "RENPY":
+                names = renpy_engine.extract(layout.root / "game").names  # read-only
+            else:
+                names = collect_glossary_names(layout)
         except Exception as e:  # noqa: BLE001
             messagebox.showerror("오류", f"게임 폴더를 분석하지 못했습니다:\n{e}")
             return
