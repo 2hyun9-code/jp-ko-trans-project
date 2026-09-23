@@ -113,6 +113,7 @@ def _parse_llm_array(text: str, n: int) -> list[str]:
 class Provider:
     id = ""
     label = ""
+    short_label = ""
     note = ""
     needs_key = False
     needs_base_url = False
@@ -157,6 +158,7 @@ class Provider:
 class GoogleFree(Provider):
     id = "google_free"
     label = "구글 번역 (무료, 키 없음)"
+    short_label = "구글 무료"
     note = "키 없이 바로 쓸 수 있어요. 비공식 경로라 한 번에 많이 돌리면 잠시 막힐 수 있습니다."
     URL = "https://translate.googleapis.com/translate_a/single"
     batch_size = 1
@@ -179,6 +181,7 @@ class GoogleFree(Provider):
 class GoogleCloud(Provider):
     id = "google_cloud"
     label = "Google Cloud 번역 (공식 API 키)"
+    short_label = "Google Cloud"
     note = ("Google Cloud 콘솔의 Cloud Translation API 키. 키에 'HTTP 리퍼러(웹사이트)' 제한이 "
             "걸려 있으면 이 프로그램에서는 막힙니다 — 제한을 '없음'이나 'IP 주소'로 바꾸세요.")
     URL = "https://translation.googleapis.com/language/translate/v2"
@@ -202,6 +205,7 @@ class GoogleCloud(Provider):
 class DeepL(Provider):
     id = "deepl"
     label = "DeepL"
+    short_label = "DeepL"
     note = "deepl.com 에서 API 키 발급 (무료 키는 끝이 ':fx', 월 50만 자까지)."
     needs_key = True
     batch_size = 50
@@ -228,6 +232,7 @@ class DeepL(Provider):
 class OpenAICompatible(Provider):
     id = "openai_compat"
     label = "OpenAI 호환 (OpenAI·OpenRouter·LM Studio 등)"
+    short_label = "OpenAI 호환"
     note = ("OpenAI 방식으로 받는 서버면 다 됩니다. 주소는 .../v1 까지만 넣으세요. "
             "키가 필요 없는 로컬 서버는 키 칸을 비워 두세요.")
     needs_base_url = True
@@ -266,6 +271,7 @@ class OpenAICompatible(Provider):
 class ClaudeProvider(Provider):
     id = "claude"
     label = "Claude (Anthropic API 키)"
+    short_label = "Claude"
     note = ("console.anthropic.com 에서 키 발급. 거절된 묶음은 서버에서 다른 Claude 모델이 "
             "이어받고, 그래도 안 되면 로컬 모델이 번역합니다.")
     needs_key = True
@@ -335,6 +341,7 @@ class ClaudeProvider(Provider):
 class Gemini(Provider):
     id = "gemini"
     label = "Gemini (Google AI Studio 키)"
+    short_label = "Gemini"
     note = "aistudio.google.com 에서 키 발급. 모델 이름은 AI Studio 목록에 있는 그대로 넣으세요."
     BASE = "https://generativelanguage.googleapis.com/v1beta"
     needs_key = True

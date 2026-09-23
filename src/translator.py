@@ -6,6 +6,7 @@ import json
 import re
 import threading
 import time
+import unicodedata
 from pathlib import Path
 
 import requests
@@ -58,6 +59,9 @@ def _has_foreign_leakage(original: str, translated: str) -> bool:
     nouns the game itself keeps untranslated) are allowed through."""
     if _CYRILLIC_RE.search(translated):
         return True
+    # Japanese text often writes Latin letters full-width ("ＨＰ"); the
+    # translation's normal-width "HP" is the same word, not a leak.
+    original = unicodedata.normalize("NFKC", original)
     for word in _LATIN_WORD_RE.findall(translated):
         if word not in original:
             return True
@@ -343,15 +347,19 @@ class OllamaTranslator:
             "번역을 그대로 사용하세요:\n" + "\n".join(pairs)
         )
 
-    def translate(self, text: str) -> str:
+    def translate(self, text: str, force: bool = False) -> str:
         """Thread-safe: safe to call concurrently from multiple worker threads
         (each unique `text` only ever does real work once; a duplicate that
         arrives while another thread is still translating the same string
         just re-translates it, the second write simply overwrites the first
-        with an equivalent result)."""
+        with an equivalent result).
+
+        `force` ignores an existing cache entry (re-translation from the
+        review window); the old value stays in place until the new one
+        replaces it, so an interrupted re-translation loses nothing."""
         if not text.strip():
             return text
-        cached = self.cache.get(text)
+        cached = None if force else self.cache.get(text)
         if cached is not None:
             return cached
 

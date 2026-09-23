@@ -17,7 +17,7 @@ import threading
 import time
 import tkinter as tk
 from pathlib import Path
-from tkinter import filedialog, messagebox
+from tkinter import filedialog, messagebox, ttk
 
 import customtkinter as ctk
 
@@ -25,11 +25,11 @@ import keystore
 import notify
 import ollama_ctl
 import power
+import review
 from engine import detect_project
 from pipeline import MODE_LABELS, REVIEW_FILENAME, run_all
 from providers import PROVIDERS, FatalProviderError, ProviderError, create_provider
-from render_patch import build_translation_map, inject_render_patch
-from textwalk import collect_glossary_names, walk_project
+from textwalk import collect_glossary_names
 from translator import OllamaTranslator, protect_codes, restore_codes
 
 ctk.set_appearance_mode("System")
@@ -171,8 +171,7 @@ class LocalizerGUI:
         self.open_btn = ctk.CTkButton(btn_frm, text="결과 폴더 열기", command=self._open_output,
                                        state="disabled")
         self.open_btn.pack(side="left", padx=4)
-        self.review_btn = ctk.CTkButton(btn_frm, text="검토 항목 보기", command=self._open_review,
-                                         state="disabled")
+        self.review_btn = ctk.CTkButton(btn_frm, text="검토 · 번역 목록", command=self._open_review)
         self.review_btn.pack(side="left", padx=4)
         self.glossary_btn = ctk.CTkButton(btn_frm, text="용어집 확인/수정", command=self._open_glossary)
         self.glossary_btn.pack(side="left", padx=4)
@@ -187,7 +186,6 @@ class LocalizerGUI:
         self.log_text.pack(fill="both", expand=True)
 
         self.result_path: str | None = None
-        self.result_model: str | None = None
         self.result_cache_path: str | None = None
         self.log_file_path: str | None = None
         root.after(100, self._poll_queue)
@@ -507,9 +505,8 @@ class LocalizerGUI:
         self._clear_log()
 
         cache_path = self._cache_path_for(out)
-        self.result_model = model
+        self.result_path = None
         self.result_cache_path = cache_path
-        self.review_btn.configure(state="disabled")
 
         self.log_file_path = self._log_path_for(out)
         engines = f"로컬 모델: {model}" if provider is None else (
@@ -582,17 +579,31 @@ class LocalizerGUI:
             return 0
 
     def _open_review(self):
-        p = self._review_path()
-        if not p or not self.result_model or not self.result_cache_path:
-            messagebox.showinfo("검토 항목 없음", "검토가 필요한 항목이 없어요.")
+        """Opens the review table for this run's output, or -- without a run
+        in this session -- for whatever output folder is filled in."""
+        if self.worker and self.worker.is_alive():
+            messagebox.showinfo("번역 진행 중", "번역이 끝난 뒤에 검토할 수 있어요.")
             return
+        out = self.result_path or self.out_var.get().strip()
+        if not out:
+            messagebox.showerror("오류", "출력 폴더를 먼저 지정해주세요.")
+            return
+        cache_path = self.result_cache_path or self._cache_path_for(out)
         try:
-            items = json.loads(p.read_text(encoding="utf-8"))
+            session = review.open_session(out, cache_path)
+        except FileNotFoundError:
+            messagebox.showinfo("검토할 번역 없음",
+                                "이 출력 폴더에는 아직 번역 결과가 없어요. 먼저 '번역 시작'을 해주세요.")
+            return
         except Exception as e:  # noqa: BLE001
             messagebox.showerror("오류", f"검토 목록을 읽지 못했습니다:\n{e}")
             return
-        ReviewWindow(self.root, self.result_path, self.result_model,
-                      self.result_cache_path, items, self._log)
+        try:
+            workers = max(1, int(self.workers_var.get()))
+        except ValueError:
+            workers = 4
+        ReviewWindow(self.root, session, self.model_var.get().strip() or session.local_model,
+                     workers, self._log)
 
     def _open_glossary(self):
         game = self.game_var.get().strip()
@@ -669,8 +680,6 @@ class LocalizerGUI:
                     self.cancel_btn.configure(state="disabled")
                     self.open_btn.configure(state="normal")
                     review_count = self._review_count()
-                    if review_count:
-                        self.review_btn.configure(state="normal")
 
                     if self.notify_close_var.get() or self.auto_shutdown_var.get():
                         body = (f"검토 필요 항목 {review_count}개" if review_count
@@ -693,7 +702,7 @@ class LocalizerGUI:
                             "완료",
                             f"번역이 완료되었습니다:\n{payload}\n\n"
                             f"검토가 필요한 항목이 {review_count}개 있어요 "
-                            f"('검토 항목 보기' 버튼으로 확인).",
+                            f"('검토 · 번역 목록' 버튼으로 확인).",
                         )
                     else:
                         messagebox.showinfo("완료", f"번역이 완료되었습니다:\n{payload}")
@@ -711,18 +720,14 @@ class LocalizerGUI:
         self.root.after(100, self._poll_queue)
 
 
-_REASON_LABELS = {"fallback": "원문 유지", "length": "번역이 김", "untranslated": "번역 안 됨"}
-
-
 class _TermListWindow(ctk.CTkToplevel):
-    """Shared list+detail term editor: a scrollable list of source strings
-    on the left, an editable translation box on the right. Both the
-    post-run review list (ReviewWindow) and the pre-run glossary editor
-    (GlossaryWindow) are this same UI -- they only differ in where their
-    items come from and what (if anything) needs patching after a save."""
+    """List+detail term editor used for the pre-run glossary: a scrollable
+    list of source strings on the left, an editable translation box on the
+    right. Glossaries are small, so one button per entry is fine here (the
+    post-run review list uses a table instead -- see ReviewWindow)."""
 
     def __init__(self, parent, title: str, log_label: str, model: str,
-                 cache_path: str, items: list[dict], log_fn, show_reason: bool):
+                 cache_path: str, items: list[dict], log_fn):
         super().__init__(parent)
         self.title(title)
         self.geometry("800x500")
@@ -731,7 +736,6 @@ class _TermListWindow(ctk.CTkToplevel):
         self.cache_path = cache_path
         self.items = items
         self.log_fn = log_fn
-        self.show_reason = show_reason
         self.selected_idx: int | None = None
         self.item_buttons: list[ctk.CTkButton] = []
 
@@ -744,11 +748,6 @@ class _TermListWindow(ctk.CTkToplevel):
 
         right = ctk.CTkFrame(pane, fg_color="transparent")
         right.pack(side="left", fill="both", expand=True, padx=(10, 0))
-
-        if show_reason:
-            ctk.CTkLabel(right, text="사유").pack(anchor="w")
-            self.reason_var = tk.StringVar()
-            ctk.CTkLabel(right, textvariable=self.reason_var).pack(anchor="w")
 
         ctk.CTkLabel(right, text="원문").pack(anchor="w", pady=(8, 0))
         self.source_text = ctk.CTkTextbox(right, height=80, wrap="word", state="disabled")
@@ -772,8 +771,6 @@ class _TermListWindow(ctk.CTkToplevel):
             self._select(0)
 
     def _list_label(self, item: dict) -> str:
-        if self.show_reason:
-            return f"[{_REASON_LABELS.get(item['reason'], item['reason'])}] {item['source'][:22]}"
         mark = "✓" if item.get("translated") else "…"
         return f"[{mark}] {item['source'][:22]}"
 
@@ -803,8 +800,6 @@ class _TermListWindow(ctk.CTkToplevel):
         self.selected_idx = idx
         self._highlight_selected()
         item = self.items[idx]
-        if self.show_reason:
-            self.reason_var.set(_REASON_LABELS.get(item["reason"], item["reason"]))
         self.source_text.configure(state="normal")
         self.source_text.delete("1.0", "end")
         self.source_text.insert("1.0", item["source"])
@@ -812,23 +807,17 @@ class _TermListWindow(ctk.CTkToplevel):
         self.translated_text.delete("1.0", "end")
         self.translated_text.insert("1.0", item.get("translated", ""))
 
-    def _after_save(self, item: dict, old_value: str, new_value: str) -> None:
-        """Hook for subclasses that need to react to a saved edit (e.g. patch
-        already-generated output files). No-op by default."""
-
     def _save(self):
         if self.selected_idx is None:
             return
         item = self.items[self.selected_idx]
         new_value = self.translated_text.get("1.0", "end").strip()
-        old_value = item.get("translated", "")
-        if new_value == old_value:
+        if new_value == item.get("translated", ""):
             return
         try:
             translator = OllamaTranslator(model=self.model, cache_path=self.cache_path)
             translator.cache.set(item["source"], new_value, origin="manual")
             translator.cache.save()
-            self._after_save(item, old_value, new_value)
         except Exception as e:  # noqa: BLE001
             messagebox.showerror("오류", f"저장에 실패했습니다:\n{e}")
             return
@@ -839,21 +828,18 @@ class _TermListWindow(ctk.CTkToplevel):
     def _retranslate(self):
         if self.selected_idx is None:
             return
-        idx = self.selected_idx
-        item = self.items[idx]
+        item = self.items[self.selected_idx]
         self.save_btn.configure(state="disabled")
         self.retranslate_btn.configure(state="disabled")
 
         def run():
             try:
                 translator = OllamaTranslator(model=self.model, cache_path=self.cache_path)
-                old_value = item.get("translated", "")
-                translator.cache.delete(item["source"])
-                new_value = translator.translate(item["source"])
+                new_value = translator.translate(item["source"], force=True)
                 translator.cache.save()
-                self._after_save(item, old_value, new_value)
             except Exception as e:  # noqa: BLE001
-                self.after(0, lambda: messagebox.showerror("오류", f"번역에 실패했습니다:\n{e}"))
+                msg = f"번역에 실패했습니다:\n{e}"  # `e` is unbound once the except block ends
+                self.after(0, lambda: messagebox.showerror("오류", msg))
                 self.after(0, self._retranslate_done, None)
                 return
             self.after(0, self._retranslate_done, new_value)
@@ -872,32 +858,6 @@ class _TermListWindow(ctk.CTkToplevel):
         self._select(idx)
 
 
-class ReviewWindow(_TermListWindow):
-    """Lists the entries pipeline.run_all() flagged as needing a look --
-    either the model never produced Korean (source text was kept as-is) or
-    the Korean came out much longer than the source (overflow risk). Lets
-    you hand-edit a translation or force a single re-translate, and patches
-    the on-disk cache, the already-generated output JSON files, and the
-    render-time patch (js/korean_patch.js) so a plugin-text edit actually
-    shows up in-game too, not just in data/*.json."""
-
-    def __init__(self, parent, out_path: str, model: str, cache_path: str,
-                 items: list[dict], log_fn):
-        self.out_path = out_path
-        super().__init__(parent, f"검토 항목 ({len(items)}개)", "검토", model,
-                          cache_path, items, log_fn, show_reason=True)
-
-    def _after_save(self, item, old_value, new_value):
-        # An untranslated item (reason "untranslated") has no old translation:
-        # what's actually sitting in the output files is the source text.
-        on_disk = old_value or item["source"]
-        layout = detect_project(self.out_path)
-        walk_project(layout, lambda t: new_value if t == on_disk else t)
-        translator = OllamaTranslator(model=self.model, cache_path=self.cache_path)
-        translation_map = build_translation_map(translator.cache.data)
-        inject_render_patch(layout, translation_map)
-
-
 class GlossaryWindow(_TermListWindow):
     """Pre-run editor for proper nouns (actor/class/item/... names, map
     display names, MZ name-box speaker names) -- lets you pin a name's
@@ -908,7 +868,311 @@ class GlossaryWindow(_TermListWindow):
 
     def __init__(self, parent, model: str, cache_path: str, items: list[dict], log_fn):
         super().__init__(parent, f"용어집 ({len(items)}개)", "용어집", model,
-                          cache_path, items, log_fn, show_reason=False)
+                          cache_path, items, log_fn)
+
+
+def _preview(text: str, width: int = 70) -> str:
+    one_line = text.replace("\n", " ⏎ ")
+    return one_line if len(one_line) <= width else one_line[:width - 1] + "…"
+
+
+class ReviewWindow(ctk.CTkToplevel):
+    """Post-run review: a filterable table of translations (only the flagged
+    ones, or every text in the game), hand edits, and re-translating a
+    multi-selection with the local model. Changes pile up in `pending` and
+    go into the output game in one batch ("게임에 적용")."""
+
+    ROW_LIMIT = 20000
+    _VIEWS = {"flagged": "검토 필요 항목", "all": "전체 번역"}
+
+    def __init__(self, parent, session: review.ReviewSession, local_model: str,
+                 workers: int, log_fn):
+        super().__init__(parent)
+        self.session = session
+        self.local_model = local_model
+        self.workers = workers
+        self.log_fn = log_fn
+        self.pending: dict[str, str | None] = {}
+        self.rows: list[dict] = []
+        self.busy = False
+        self.cancel_flag = False
+        self.q: "queue.Queue[tuple[str, object]]" = queue.Queue()
+        self.title("검토 · 번역 목록")
+        self.geometry("1150x720")
+        self.minsize(900, 560)
+        self.after(150, self.lift)
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
+
+        bar = ctk.CTkFrame(self, fg_color="transparent")
+        bar.pack(fill="x", padx=12, pady=(12, 6))
+        self.view_var = tk.StringVar(value=self._VIEWS["flagged" if session.flagged else "all"])
+        ctk.CTkLabel(bar, text="보기").pack(side="left", padx=(0, 6))
+        ctk.CTkOptionMenu(bar, variable=self.view_var, values=list(self._VIEWS.values()),
+                          width=150, command=lambda _v: self._reload()).pack(side="left")
+        self.origin_var = tk.StringVar(value=review.ORIGIN_FILTERS["all"])
+        ctk.CTkLabel(bar, text="출처").pack(side="left", padx=(16, 6))
+        ctk.CTkOptionMenu(bar, variable=self.origin_var, values=list(review.ORIGIN_FILTERS.values()),
+                          width=130, command=lambda _v: self._reload()).pack(side="left")
+        self.search_entry = ctk.CTkEntry(bar, placeholder_text="원문/번역 검색 (Enter)", width=260)
+        self.search_entry.pack(side="left", padx=(16, 6))
+        self.search_entry.bind("<Return>", lambda _e: self._reload())
+        ctk.CTkButton(bar, text="검색", width=60, command=self._reload).pack(side="left")
+        self.count_var = tk.StringVar()
+        ctk.CTkLabel(bar, textvariable=self.count_var).pack(side="right")
+
+        table = ctk.CTkFrame(self, fg_color="transparent")
+        table.pack(fill="both", expand=True, padx=12)
+        self._style_tree()
+        cols = ("origin", "reason", "source", "translated")
+        self.tree = ttk.Treeview(table, columns=cols, show="headings", selectmode="extended",
+                                 style="Review.Treeview")
+        for col, text, width, stretch in (("origin", "출처", 180, False), ("reason", "사유", 90, False),
+                                          ("source", "원문", 420, True),
+                                          ("translated", "번역", 420, True)):
+            self.tree.heading(col, text=text)
+            self.tree.column(col, width=width, stretch=stretch, anchor="w")
+        scroll = ctk.CTkScrollbar(table, command=self.tree.yview)
+        self.tree.configure(yscrollcommand=scroll.set)
+        self.tree.pack(side="left", fill="both", expand=True)
+        scroll.pack(side="right", fill="y")
+        self.tree.bind("<<TreeviewSelect>>", lambda _e: self._on_select())
+
+        detail = ctk.CTkFrame(self, fg_color="transparent")
+        detail.pack(fill="x", padx=12, pady=(8, 0))
+        detail.columnconfigure((0, 1), weight=1)
+        self.detail_var = tk.StringVar(value="항목을 고르세요. Ctrl/Shift+클릭으로 여러 개 선택할 수 있어요.")
+        ctk.CTkLabel(detail, textvariable=self.detail_var, anchor="w").grid(
+            row=0, column=0, columnspan=2, sticky="we")
+        self.source_box = ctk.CTkTextbox(detail, height=110, wrap="word", state="disabled")
+        self.source_box.grid(row=1, column=0, sticky="nsew", padx=(0, 6), pady=4)
+        self.translated_box = ctk.CTkTextbox(detail, height=110, wrap="word")
+        self.translated_box.grid(row=1, column=1, sticky="nsew", padx=(6, 0), pady=4)
+        self.translated_box.bind("<Control-s>", lambda _e: (self._save_manual(), "break")[1])
+
+        actions = ctk.CTkFrame(self, fg_color="transparent")
+        actions.pack(fill="x", padx=12, pady=(4, 12))
+        self.save_btn = ctk.CTkButton(actions, text="수정 저장 (Ctrl+S)", width=140,
+                                      command=self._save_manual, state="disabled")
+        self.save_btn.pack(side="left", padx=(0, 6))
+        self.retranslate_btn = ctk.CTkButton(actions, text="선택 항목 로컬로 재번역", width=210,
+                                             command=self._retranslate, state="disabled")
+        self.retranslate_btn.pack(side="left", padx=6)
+        self.cancel_btn = ctk.CTkButton(actions, text="중단", width=70, fg_color="#a83232",
+                                        hover_color="#8a2828", command=self._cancel)
+        self.status_var = tk.StringVar()
+        ctk.CTkLabel(actions, textvariable=self.status_var).pack(side="left", padx=10)
+        ctk.CTkButton(actions, text="닫기", width=80, fg_color="#555", hover_color="#444",
+                      command=self._on_close).pack(side="right")
+        self.apply_btn = ctk.CTkButton(actions, text="게임에 적용", width=150,
+                                       command=self._apply, state="disabled")
+        self.apply_btn.pack(side="right", padx=6)
+
+        self._reload()
+        self.after(100, self._poll)
+
+    # ------------------------------------------------------------ table
+    def _style_tree(self):
+        dark = ctk.get_appearance_mode() == "Dark"
+        bg, fg, sel, head = (("#2b2b2b", "#e6e6e6", "#1f538d", "#333333") if dark
+                             else ("#ffffff", "#1a1a1a", "#c7dcff", "#e8e8e8"))
+        style = ttk.Style(self)
+        style.theme_use("clam")
+        # Segoe UI + Windows font linking renders both kana and Hangul with
+        # normal spacing; Malgun Gothic has no kana and its fallback spreads
+        # Japanese out letter by letter.
+        style.configure("Review.Treeview", background=bg, fieldbackground=bg, foreground=fg,
+                        rowheight=26, font=("Segoe UI", 10), borderwidth=0)
+        style.configure("Review.Treeview.Heading", background=head, foreground=fg,
+                        font=("Segoe UI", 10, "bold"), relief="flat")
+        style.map("Review.Treeview", background=[("selected", sel)],
+                  foreground=[("selected", "#ffffff" if dark else "#000000")])
+
+    def _filters(self) -> tuple[str, str, str]:
+        view = next(k for k, v in self._VIEWS.items() if v == self.view_var.get())
+        origin = next(k for k, v in review.ORIGIN_FILTERS.items() if v == self.origin_var.get())
+        return view, origin, self.search_entry.get()
+
+    def _row_values(self, row: dict) -> tuple:
+        reason = review.REASON_LABELS.get(row["reason"] or "", "")
+        if row["guarded"] and not reason:
+            reason = "이름 보호"
+        return (review.origin_label(row["origin"], row["translated"]), reason,
+                _preview(row["source"]), _preview(row["translated"]))
+
+    def _reload(self):
+        view, origin, query = self._filters()
+        self.rows = review.rows(self.session, view, origin, query, limit=self.ROW_LIMIT + 1)
+        truncated = len(self.rows) > self.ROW_LIMIT
+        self.rows = self.rows[:self.ROW_LIMIT]
+        self.tree.delete(*self.tree.get_children())
+        for i, row in enumerate(self.rows):
+            self.tree.insert("", "end", iid=str(i), values=self._row_values(row))
+        more = f" (최대 {self.ROW_LIMIT}개까지만 표시 -- 검색/필터로 좁혀주세요)" if truncated else ""
+        self.count_var.set(f"{len(self.rows)}개{more}")
+        self._on_select()
+
+    def _selected(self) -> list[dict]:
+        return [self.rows[int(iid)] for iid in self.tree.selection()]
+
+    def _on_select(self):
+        sel = self._selected()
+        idle = "disabled" if self.busy else "normal"
+        self.retranslate_btn.configure(
+            text=f"선택 {len(sel)}개 로컬로 재번역" if sel else "선택 항목 로컬로 재번역",
+            state=idle if sel else "disabled")
+        self.save_btn.configure(state=idle if len(sel) == 1 else "disabled")
+        self.source_box.configure(state="normal")
+        self.source_box.delete("1.0", "end")
+        self.translated_box.delete("1.0", "end")
+        if len(sel) == 1:
+            row = sel[0]
+            self.source_box.insert("1.0", row["source"])
+            self.translated_box.insert("1.0", row["translated"])
+            note = " · 플러그인이 이름으로 찾는 값이라 데이터에는 원문, 화면에만 번역 표시" if row["guarded"] else ""
+            self.detail_var.set(f"{review.origin_label(row['origin'], row['translated'])}{note}")
+        elif sel:
+            self.detail_var.set(f"{len(sel)}개 선택됨")
+        self.source_box.configure(state="disabled")
+
+    def _refresh_rows(self, sources: set[str]):
+        for i, row in enumerate(self.rows):
+            if row["source"] in sources:
+                tr = self.session.cache.get(row["source"]) or ""
+                origin = self.session.cache.get_origin(row["source"])
+                row.update(translated=tr, origin=origin, kind=review.origin_kind(origin, tr),
+                           reason=review._reason_for(row["source"], tr or None))
+                self.tree.item(str(i), values=self._row_values(row))
+        self._on_select()
+        self._update_apply_btn()
+
+    def _update_apply_btn(self):
+        n = len(self.pending)
+        self.apply_btn.configure(text=f"게임에 적용 ({n}개 대기)" if n else "게임에 적용",
+                                 state="normal" if n and not self.busy else "disabled")
+
+    # ------------------------------------------------------------ edits
+    def _save_manual(self):
+        sel = self._selected()
+        if len(sel) != 1 or self.busy:
+            return
+        src = sel[0]["source"]
+        value = self.translated_box.get("1.0", "end").rstrip("\n")
+        if not value.strip() or value == sel[0]["translated"]:
+            return
+        review.set_manual(self.session, src, value, self.pending)
+        self.log_fn(f"검토: 수정 저장됨 -> {src[:30]}")
+        self._refresh_rows({src})
+
+    def _retranslate(self):
+        sources = [r["source"] for r in self._selected()]
+        if not sources or self.busy:
+            return
+        if not ollama_ctl.is_running():
+            messagebox.showwarning("Ollama가 꺼져 있습니다",
+                                   "로컬 재번역을 하려면 메인 창에서 Ollama를 먼저 켜주세요.", parent=self)
+            return
+        if len(sources) > 200 and not messagebox.askyesno(
+                "재번역", f"{len(sources)}개를 로컬 모델({self.local_model})로 다시 번역합니다.\n"
+                          "시간이 꽤 걸릴 수 있어요. 진행할까요?", parent=self):
+            return
+        self._set_busy(True, f"로컬 재번역 0/{len(sources)}")
+        self.cancel_flag = False
+
+        def run():
+            changes, error = review.retranslate_local(
+                self.session, sources, self.local_model, self.workers,
+                progress=lambda d, t: self.q.put(("status", f"로컬 재번역 {d}/{t}")),
+                should_cancel=lambda: self.cancel_flag,
+                log=lambda m: self.q.put(("log", m)))
+            self.q.put(("retranslated", (changes, error, len(sources))))
+
+        threading.Thread(target=run, daemon=True).start()
+
+    def _cancel(self):
+        self.cancel_flag = True
+        self.status_var.set("중단하는 중... (진행 중인 문장은 마저 끝납니다)")
+
+    def _apply(self, then_close: bool = False):
+        if not self.pending or self.busy:
+            if then_close:
+                self.destroy()
+            return
+        changes = dict(self.pending)
+        self._set_busy(True, f"게임에 적용 중... ({len(changes)}개)")
+
+        def run():
+            try:
+                written = review.apply_changes(self.session, changes)
+                self.q.put(("applied", (changes, written, None, then_close)))
+            except Exception as e:  # noqa: BLE001
+                self.q.put(("applied", (changes, 0, str(e), then_close)))
+
+        threading.Thread(target=run, daemon=True).start()
+
+    def _set_busy(self, busy: bool, status: str = ""):
+        self.busy = busy
+        self.status_var.set(status)
+        if busy:
+            self.cancel_btn.pack(side="left", padx=6, after=self.retranslate_btn)
+        else:
+            self.cancel_btn.pack_forget()
+        self._on_select()
+        self._update_apply_btn()
+
+    def _poll(self):
+        try:
+            while True:
+                kind, payload = self.q.get_nowait()
+                if kind == "status":
+                    self.status_var.set(payload)
+                elif kind == "log":
+                    self.log_fn(payload)
+                elif kind == "retranslated":
+                    changes, error, total = payload
+                    for src, before in changes.items():
+                        self.pending.setdefault(src, before)
+                    self._set_busy(False, f"로컬 재번역 {len(changes)}/{total}개 완료")
+                    self._refresh_rows(set(changes))
+                    self.log_fn(f"검토: 로컬 재번역 {len(changes)}/{total}개")
+                    if error:
+                        messagebox.showerror("재번역 중단", f"{len(changes)}개까지 하고 멈췄어요:\n{error}",
+                                             parent=self)
+                elif kind == "applied":
+                    changes, written, error, then_close = payload
+                    if error:
+                        self._set_busy(False, "적용 실패")
+                        messagebox.showerror("적용 실패", error, parent=self)
+                        continue
+                    for src in changes:
+                        self.pending.pop(src, None)
+                    self._set_busy(False, f"게임에 적용 완료 ({len(changes)}개)")
+                    self.log_fn(f"검토: {len(changes)}개 게임에 적용 (데이터 파일 {written}개 반영, "
+                                f"나머지는 화면 출력 패치로)")
+                    if then_close:
+                        self.destroy()
+                        return
+        except queue.Empty:
+            pass
+        if self.winfo_exists():
+            self.after(100, self._poll)
+
+    def _on_close(self):
+        if self.busy:
+            if not messagebox.askyesno("작업 중", "재번역/적용이 진행 중이에요. 중단하고 닫을까요?",
+                                       parent=self):
+                return
+            self.cancel_flag = True
+        if self.pending and not self.busy:
+            answer = messagebox.askyesnocancel(
+                "적용 안 된 변경", f"게임에 아직 적용하지 않은 변경이 {len(self.pending)}개 있어요.\n"
+                                  "지금 적용할까요?\n\n(아니오: 번역 캐시에는 남아 있어서, 다음에 "
+                                  "'번역 시작'을 하면 반영됩니다)", parent=self)
+            if answer is None:
+                return
+            if answer:
+                self._apply(then_close=True)
+                return
+        self.destroy()
 
 
 class ApiSettingsWindow(ctk.CTkToplevel):

@@ -7,7 +7,6 @@ front-end can render status its own way (print / log box / progress bar).
 from __future__ import annotations
 
 import json
-import re
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
@@ -21,13 +20,11 @@ from plugin_text import collect_plugin_strings
 from render_patch import build_translation_map, inject_render_patch
 from providers import FatalProviderError, Provider, run_api_pass
 from refindex import build_reference_index
+from review import REVIEW_FILENAME, review_items, write_meta
 from textwalk import walk_project, collect_glossary_names, collect_plugin_command_texts
-from translator import PROBLEM_LABELS, OllamaTranslator, flag_reason
-
-REVIEW_FILENAME = "_translation_review.json"
+from translator import PROBLEM_LABELS, OllamaTranslator
 
 MODE_LABELS = {"hybrid": "API 우선 + 로컬 보완", "api": "API만", "local": "로컬만"}
-_JA_RE = re.compile(r"[぀-ヿ一-鿿]")
 
 LogFn = Callable[[str], None]
 ProgressFn = Callable[[int, int], None]  # (done, total)
@@ -305,18 +302,12 @@ def run_all(
     # Post-run review list: entries that fell back to the source text after
     # every retry, came out suspiciously long (message-box overflow risk),
     # or never got translated at all (API-only mode, API failed on them).
-    flagged = []
-    for src in unique:
-        translated = translator.cache.get(src)
-        if translated is None:
-            if _JA_RE.search(src):
-                flagged.append({"source": src, "translated": "", "reason": "untranslated",
-                                "origin": None})
-            continue
-        reason = flag_reason(src, translated)
-        if reason:
-            flagged.append({"source": src, "translated": translated, "reason": reason,
-                            "origin": translator.cache.get_origin(src)})
+    flagged = review_items(unique, translator.cache)
+    # What the review window needs to re-open this output later: the game's
+    # own text list (the cache can hold stale keys), the guarded names, and
+    # the glossary names for consistent re-translation.
+    write_meta(game_root, game=game, cache_path=cache_path, local_model=model, texts=unique,
+               guarded=guarded, glossary_names=glossary_names)
     review_path = game_root / REVIEW_FILENAME
     review_path.write_text(json.dumps(flagged, ensure_ascii=False, indent=2), encoding="utf-8")
     if flagged:

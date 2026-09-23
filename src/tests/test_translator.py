@@ -235,6 +235,11 @@ def test_api_result_problem_flags_each_failure_kind():
     assert api_result_problem("こんにちは", "죄송하지만 그 요청은 번역할 수 없습니다.", {}) == "odd"
 
 
+def test_full_width_latin_in_source_matches_normal_width_in_translation():
+    assert api_result_problem("ＨＰを50回復する。", "HP를 50 회복한다.", {}) is None
+    assert api_result_problem("回復する。", "HP를 회복한다.", {}) == "foreign"
+
+
 def test_api_result_problem_does_not_flag_everyday_words():
     # "위해" is in the local path's meta-phrase list but is ordinary dialogue.
     assert api_result_problem("世界のために戦う", "세계를 위해 싸운다", {}) is None
