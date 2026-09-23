@@ -16,7 +16,11 @@ import os
 import sys
 from pathlib import Path
 
-APP_DIR_NAME = "쯔꾸르_한국어화_도구"
+APP_DIR_NAME = "JP-KO_Trans"
+# Folder name used before the app was renamed; its settings (and the DPAPI
+# keys in them, which are tied to the Windows account, not the path) are
+# carried over the first time the new location is read.
+LEGACY_APP_DIR_NAMES = ("쯔꾸르_한국어화_도구",)
 _ENTROPY = b"tsukuru-ko-localizer/api-key/v1"
 
 DEFAULT_SETTINGS = {
@@ -28,9 +32,30 @@ DEFAULT_SETTINGS = {
 }
 
 
+def _appdata() -> Path:
+    return Path(os.environ.get("APPDATA") or str(Path.home()))
+
+
 def settings_path() -> Path:
-    base = os.environ.get("APPDATA") or str(Path.home())
-    return Path(base) / APP_DIR_NAME / "settings.json"
+    return _appdata() / APP_DIR_NAME / "settings.json"
+
+
+def migrate_legacy_settings() -> bool:
+    """Copies settings.json from the pre-rename folder if the new one doesn't
+    exist yet. The old file is left in place. Returns True if copied."""
+    new = settings_path()
+    if new.exists():
+        return False
+    for name in LEGACY_APP_DIR_NAMES:
+        old = _appdata() / name / "settings.json"
+        try:
+            content = old.read_bytes()
+        except OSError:
+            continue
+        new.parent.mkdir(parents=True, exist_ok=True)
+        new.write_bytes(content)
+        return True
+    return False
 
 
 # --------------------------------------------------------------------------
@@ -78,7 +103,12 @@ def decrypt_text(token: str) -> str:
 # Settings file
 # --------------------------------------------------------------------------
 def load_settings(path: Path | None = None) -> dict:
-    path = path or settings_path()
+    if path is None:
+        try:
+            migrate_legacy_settings()
+        except OSError:
+            pass
+        path = settings_path()
     settings = json.loads(json.dumps(DEFAULT_SETTINGS))  # deep copy
     try:
         stored = json.loads(path.read_text(encoding="utf-8"))

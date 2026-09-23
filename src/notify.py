@@ -20,7 +20,7 @@ $textNodes = $template.GetElementsByTagName("text")
 $textNodes.Item(0).AppendChild($template.CreateTextNode({title})) | Out-Null
 $textNodes.Item(1).AppendChild($template.CreateTextNode({body})) | Out-Null
 $toast = [Windows.UI.Notifications.ToastNotification]::new($template)
-[Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier("쯔꾸르 한국어화 도구").Show($toast)
+[Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier("JP-KO Trans").Show($toast)
 """
 
 

@@ -29,7 +29,7 @@ exe = EXE(
     a.binaries,
     a.datas,
     [],
-    name='쯔꾸르_한국어화_도구',
+    name='JP-KO_Trans',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,

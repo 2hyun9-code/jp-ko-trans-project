@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Callable, Optional
 
 import renpy_engine
+import tyrano_engine
 from engine import detect_project
 from providers import PROVIDERS
 from render_patch import build_translation_map, inject_render_patch
@@ -77,10 +78,11 @@ def _reason_for(src: str, translated: Optional[str]) -> Optional[str]:
 
 
 def write_meta(game_root: Path, *, engine: str, game: str, cache_path: str, local_model: str,
-               texts: list[str], guarded: set[str], glossary_names: list[str]) -> None:
+               texts: list[str], guarded: set[str], glossary_names: list[str],
+               extra: Optional[dict] = None) -> None:
     meta = {"format": 1, "engine": engine, "game": game, "cache_path": cache_path,
             "local_model": local_model, "texts": texts, "guarded": sorted(guarded),
-            "glossary_names": glossary_names}
+            "glossary_names": glossary_names, **(extra or {})}
     (game_root / META_FILENAME).write_text(json.dumps(meta, ensure_ascii=False), encoding="utf-8")
 
 
@@ -101,6 +103,7 @@ class ReviewSession:
     glossary_names: list[str] = field(default_factory=list)
     local_model: str = ""
     engine: str = "RPGMAKER"
+    tyrano: dict = field(default_factory=dict)   # where the scenario lives (TyranoScript only)
 
 
 def open_session(out_path: str, cache_path: str) -> ReviewSession:
@@ -122,6 +125,7 @@ def open_session(out_path: str, cache_path: str) -> ReviewSession:
         local_model=meta.get("local_model") or "",
         engine=meta.get("engine") or ("RENPY" if (root / "game" / renpy_engine.HOOK_FILE).exists()
                                       else "RPGMAKER"),
+        tyrano=meta.get("tyrano") or {},
     )
 
 
@@ -224,11 +228,18 @@ def apply_changes(session: ReviewSession, changes: dict[str, Optional[str]]) -> 
     both get the new one.
 
     Ren'Py output keeps the game's files untouched, so there the whole
-    translation map file is simply regenerated from the cache."""
+    translation map file is simply regenerated from the cache; TyranoScript
+    output keeps the original scenario files, so those are re-rendered."""
     written = 0
-    if session.engine == "RENPY":
+    if session.engine in ("RENPY", "TYRANO"):
         translations = {t: v for t in session.texts if (v := session.cache.get(t)) and v != t}
-        renpy_engine.write_translation(session.out_path / "game", translations)
+        if session.engine == "RENPY":
+            renpy_engine.write_translation(session.out_path / "game", translations)
+        else:
+            if not session.tyrano:
+                raise RuntimeError("번역 정보 파일에 TyranoScript 게임 위치가 없습니다.")
+            container = tyrano_engine.container_from_meta(session.out_path, session.tyrano)
+            tyrano_engine.apply(session.out_path, container, translations)
         written = sum(1 for src in changes if src in translations)
     else:
         layout = detect_project(str(session.out_path))

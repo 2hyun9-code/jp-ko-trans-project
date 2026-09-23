@@ -19,6 +19,7 @@ from plugin_install import install_hangul_name_plugin
 from plugin_text import collect_plugin_strings
 from render_patch import build_translation_map, inject_render_patch
 import renpy_engine
+import tyrano_engine
 from providers import FatalProviderError, Provider, run_api_pass
 from refindex import build_reference_index
 from review import REVIEW_FILENAME, review_items, write_meta
@@ -225,6 +226,49 @@ def _run_renpy(src_layout, game: str, out: str, font: Optional[str], model: str,
     return str(out_layout.root)
 
 
+def _run_tyrano(out_layout, game_root: Path, game: str, font: Optional[str], model: str,
+                cache_path: str, log: LogFn, progress: Optional[ProgressFn],
+                should_cancel: Optional[Callable[[], bool]], workers: int, mode: str,
+                provider: Optional[Provider]) -> str:
+    """TyranoScript: the .ks scenario files in the copy are rewritten; the
+    untouched originals are kept next to the game so the review window can
+    regenerate them later."""
+    container = tyrano_engine.find_container(out_layout.root)
+    if container is None:
+        raise RuntimeError("TyranoScript 시나리오 폴더(data/scenario)를 찾지 못했습니다.")
+    files = container.read_scenarios()
+    tyrano_engine.save_originals(game_root, files)
+    ext = tyrano_engine.scan(files)
+    log(f"TyranoScript 시나리오 {len(files)}개 파일 읽음 ({container.describe()}): "
+        f"번역할 텍스트 {len(ext.texts)}개, 이름 {len(ext.names)}개")
+    if not ext.texts:
+        raise RuntimeError("번역할 일본어 텍스트를 찾지 못했습니다. 시나리오가 암호화됐거나 "
+                           "지원하지 않는 형식일 수 있어요.")
+
+    translator = OllamaTranslator(model=model, cache_path=cache_path, log=log)
+    _log_mode(log, mode, provider, model)
+    _glossary_pass(ext.names, translator, provider, mode, workers, log, should_cancel)
+
+    todo = [t for t in ext.texts if translator.cache.get(t) is None]
+    log(f"총 {len(ext.texts)}개 고유 텍스트, 이 중 {len(todo)}개 새로 번역합니다.")
+    _translate_texts(todo, translator, provider, mode, workers, log, progress, should_cancel,
+                     "본문")
+
+    translations = {t: v for t in ext.texts if (v := translator.cache.get(t)) and v != t}
+    written = tyrano_engine.apply(game_root, container, translations)
+    log(f"시나리오 파일 {written}개에 번역 {len(translations)}개를 적용했습니다 "
+        f"(원본 시나리오는 {tyrano_engine.ORIGINAL_DIR} 폴더에 보관).")
+    if font:
+        log("TyranoScript는 한글을 Windows 글꼴로 자동 표시하므로 폰트 교체는 건너뜁니다.")
+
+    _finish_review(game_root, ext.texts, translator, log, engine="TYRANO", game=game,
+                   cache_path=cache_path, local_model=model, guarded=set(),
+                   glossary_names=ext.names,
+                   extra={"tyrano": tyrano_engine.container_meta(game_root, container)})
+    log(f"완료! 한국어화된 게임: {game_root}")
+    return str(game_root)
+
+
 def run_all(
     game: str,
     out: str,
@@ -271,7 +315,7 @@ def run_all(
     # report the right folder at the end.
     game_root = out_layout.launch_root
 
-    if out_layout.engine == "MZ-ASAR":
+    if out_layout.engine == "ASAR":
         asar_path = find_app_asar(out_layout.root)
         app_dir = asar_path.parent / "app"
         n = extract_asar(asar_path, app_dir)
@@ -279,6 +323,10 @@ def run_all(
         log(f"asar 압축 해제 완료 ({n}개 파일) -> {app_dir}")
         out_layout = detect_project(str(app_dir))
         log(f"엔진 재감지: {out_layout.engine} ({out_layout.root})")
+
+    if out_layout.engine == "TYRANO":
+        return _run_tyrano(out_layout, game_root, game, font, model, cache_path, log, progress,
+                           should_cancel, workers, mode, provider)
 
     if font:
         changed = swap_font(out_layout, font)

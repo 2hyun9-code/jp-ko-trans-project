@@ -19,9 +19,12 @@ OLLAMA_URL = "http://localhost:11434/api/chat"
 # interpolation ([player_name], [p.name!c], [[ escape), %(name)s formatting.
 # The Ren'Py shapes need an ASCII identifier inside the brackets, so a
 # decorative 「[重要]」 in game text is left alone and still gets translated.
+# TyranoScript: inline tags ([l], [r], [p] match the shape above) and tags
+# with attributes ([emb exp="f.name"], [font size=30]).
 _CODE_RE = re.compile(
     r"\\[NVCIPG]\[\d+\]|\\[GgSs\\{}\.\|!><\^\$]"
     r"|\{\{|\[\[|\{/?[A-Za-z_]+(?:=[^{}]*)?\}|\[[A-Za-z_][\w.]*(?:![a-z]+)?\]"
+    r"""|\[[A-Za-z_][\w-]*\s+(?:[^\[\]"'\n]|"[^"\n]*"|'[^'\n]*')*\]"""
     r"|%\([A-Za-z_]\w*\)[sdifr]",
     re.IGNORECASE,
 )

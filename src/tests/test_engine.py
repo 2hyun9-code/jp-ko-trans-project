@@ -100,7 +100,7 @@ def test_detect_project_falls_back_to_asar_marker(tmp_path):
     asar.parent.mkdir(parents=True)
     asar.write_bytes(b"fake")
     layout = detect_project(str(tmp_path))
-    assert layout.engine == "MZ-ASAR"
+    assert layout.engine == "ASAR"
     assert layout.data_dir is None
 
 

@@ -67,3 +67,19 @@ def test_undecryptable_key_reads_as_empty(monkeypatch):
 def test_corrupted_key_string_reads_as_empty():
     s = {"providers": {"deepl": {"key": "not-base64!!", "model": "", "base_url": ""}}}
     assert keystore.provider_config(s, "deepl")["key"] == ""
+
+
+def test_settings_from_the_pre_rename_folder_are_carried_over(tmp_path, monkeypatch):
+    monkeypatch.setenv("APPDATA", str(tmp_path))
+    old = tmp_path / keystore.LEGACY_APP_DIR_NAMES[0] / "settings.json"
+    old.parent.mkdir()
+    old.write_text(json.dumps({"mode": "api", "provider": "deepl"}), encoding="utf-8")
+
+    s = keystore.load_settings()
+    assert (s["mode"], s["provider"]) == ("api", "deepl")
+    assert keystore.settings_path().parent.name == keystore.APP_DIR_NAME
+    assert keystore.settings_path().exists() and old.exists()
+
+    # Once the new file exists it wins; the old one is never read again.
+    old.write_text(json.dumps({"mode": "local"}), encoding="utf-8")
+    assert keystore.load_settings()["mode"] == "api"

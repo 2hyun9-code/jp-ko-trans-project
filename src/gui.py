@@ -1,4 +1,4 @@
-"""Desktop GUI for the Japanese -> Korean game localizer (RPG Maker MV/MZ, Ren'Py).
+"""Desktop GUI for the Japanese -> Korean game localizer (RPG Maker MV/MZ, TyranoScript, Ren'Py).
 
 Wraps pipeline.run_all() in a background thread so the window stays
 responsive, and streams its log/progress into the window via a queue.
@@ -26,6 +26,7 @@ import notify
 import ollama_ctl
 import power
 import renpy_engine
+import tyrano_engine
 import review
 from engine import detect_project
 from pipeline import MODE_LABELS, REVIEW_FILENAME, run_all
@@ -72,7 +73,7 @@ def list_ollama_models() -> list[str]:
 class LocalizerGUI:
     def __init__(self, root: ctk.CTk):
         self.root = root
-        root.title("쯔꾸르 게임 한국어화 도구")
+        root.title("JP-KO Trans · 일본어 게임 한국어화 도구")
         root.geometry("780x720")
         root.minsize(700, 600)
 
@@ -623,6 +624,9 @@ class LocalizerGUI:
             layout = detect_project(game)
             if layout.engine == "RENPY":
                 names = renpy_engine.extract(layout.root / "game").names  # read-only
+            elif layout.engine in ("TYRANO", "ASAR") and (
+                    tc := tyrano_engine.find_container(Path(game), include_asar=True)):
+                names = tyrano_engine.scan(tc.read_scenarios()).names  # read-only
             else:
                 names = collect_glossary_names(layout)
         except Exception as e:  # noqa: BLE001
@@ -688,14 +692,14 @@ class LocalizerGUI:
                     if self.notify_close_var.get() or self.auto_shutdown_var.get():
                         body = (f"검토 필요 항목 {review_count}개" if review_count
                                 else "검토 항목 없음")
-                        self._append_log(notify.notify("쯔꾸르 한국어화 도구: 번역 완료", body))
+                        self._append_log(notify.notify("JP-KO Trans: 번역 완료", body))
 
                     if review_count == 0 and self.auto_shutdown_var.get():
                         self._append_log("검토 항목 없음 + 자동 종료 옵션 켜짐 -> Ollama를 끄고 "
                                           "PC 종료를 예약합니다.")
                         self._append_log(ollama_ctl.stop())
                         self._append_log(power.schedule_shutdown(
-                            60, "쯔꾸르 한국어화 도구: 번역 완료, 검토 항목 없음 - 자동 종료"))
+                            60, "JP-KO Trans: 번역 완료, 검토 항목 없음 - 자동 종료"))
                     elif review_count == 0 and self.notify_close_var.get():
                         self._append_log("검토 항목 없음 + 알림 옵션 켜짐 -> Ollama 종료를 "
                                           "확인한 뒤 프로그램을 닫습니다.")

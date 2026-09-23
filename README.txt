@@ -1,7 +1,7 @@
-일본어 게임 한국어화 도구 (jp-ko-trans-project)
-==============================================
+JP-KO Trans - 일본어 게임 한국어화 도구 (jp-ko-trans-project)
+=============================================================
 
-지원 엔진: RPG Maker MV/MZ, Ren'Py
+지원 엔진: RPG Maker MV/MZ, TyranoScript, Ren'Py
 (원본 게임 폴더를 고르면 엔진은 자동으로 판별합니다)
 
 [고지]
@@ -18,7 +18,7 @@ MIT 라이선스 플러그인입니다 (Copyright (c) 2016 SteamB23). 전체 라
 전문은 각 파일 안에 포함되어 있습니다.
 
 [사용법]
-1. 쯔꾸르_한국어화_도구.exe 더블클릭
+1. JP-KO_Trans.exe 더블클릭
 2. 원본 게임 폴더 / 출력 폴더 / 한국어 폰트(기본값: 맑은 고딕) 선택
 3. 번역 방식 고르기
    - API 우선 + 로컬 보완 (기본): API로 빠르게 먼저 번역하고, 결과를 자동
@@ -40,9 +40,11 @@ MIT 라이선스 플러그인입니다 (Copyright (c) 2016 SteamB23). 전체 라
    - Gemini: 모델 이름을 AI Studio 목록에 있는 그대로 입력.
    성인향 대사처럼 API가 거절하는 문장은 "API 우선 + 로컬 보완"에서
    자동으로 로컬 모델이 번역합니다.
-   API 키는 %APPDATA%\쯔꾸르_한국어화_도구\settings.json 에 Windows 계정
+   API 키는 %APPDATA%\JP-KO_Trans\settings.json 에 Windows 계정
    기준으로 암호화(DPAPI)되어 저장됩니다. 다른 PC나 다른 Windows 계정에서는
    풀 수 없고, 게임 폴더/출력 폴더/저장소에는 절대 저장되지 않습니다.
+   (예전 이름 '쯔꾸르_한국어화_도구' 폴더에 저장해둔 설정과 키는 처음 실행할 때
+   새 폴더로 자동으로 옮겨 옵니다. 예전 폴더는 지워도 됩니다.)
 5. 로컬 모델 확인 (드롭다운에서 설치된 Ollama 모델 자동으로 나옴)
 6. (선택) "용어집 확인/수정" 으로 캐릭터명 등 고유명사를 미리 확인·수정
    - 원본 게임 폴더 / 출력 폴더 / 번역 모델을 먼저 지정해야 열립니다.
@@ -88,7 +90,7 @@ MIT 라이선스 플러그인입니다 (Copyright (c) 2016 SteamB23). 전체 라
    - 번역 모델을 확인해서 없을 때만 다운로드 (약 8.4GB)
    - 동시 번역 처리량 환경변수까지 자동 설정
    - winget이 없는 환경이면 아래 수동 설치 안내로 넘어갑니다
-   - 쯔꾸르_한국어화_도구.exe가 없으면(예: GitHub에서 소스만 받은 경우)
+   - JP-KO_Trans.exe가 없으면(예: GitHub에서 소스만 받은 경우)
      Python이 설치되어 있을 때 자동으로 소스에서 빌드합니다. Python이
      없으면 설치 안내가 나옵니다 (https://python.org, 설치 시 "Add
      python.exe to PATH" 체크 필요).
@@ -125,7 +127,7 @@ VRAM이 부족한 컴퓨터는 qwen2.5:7b-instruct 같은 더 작은 모델을 �
 
 재빌드 명령어:
     cd src
-    pyinstaller --noconfirm --onefile --windowed --name "쯔꾸르_한국어화_도구" ^
+    pyinstaller --noconfirm --onefile --windowed --name "JP-KO_Trans" ^
       --collect-all customtkinter --add-data "plugins;plugins" --distpath .. gui.py
 
 이 위 exe 파일을 덮어써서 새로 만들어줍니다.
@@ -158,6 +160,29 @@ VRAM이 부족한 컴퓨터는 qwen2.5:7b-instruct 같은 더 작은 모델을 �
   지킵니다.
 - 한계: 대사가 암호화된 게임은 읽지 못합니다. 캐릭터 이름 같은 화면 문구는
   찾을 수 있는 만큼 찾지만, 스크립트 구조가 특이하면 빠지는 문구가 있을 수 있어요.
+
+[TyranoScript 게임]
+- 원본 게임 폴더로 게임 exe가 있는 폴더를 고르면 됩니다. 게임이 어떤 형태로
+  들어 있든 찾아냅니다:
+    폴더 그대로 (data/scenario, resources/app, package.nw 폴더 등)
+    package.nw 압축 파일, 또는 NW.js exe 뒤에 붙은 압축 (exe 하나에 게임이 통째로)
+    Electron의 resources/app.asar (출력 폴더에서 압축을 풀어 resources/app으로
+    바꾸고, 원래 파일은 app.asar.bak으로 남김 -- RPG Maker MZ와 같은 방식)
+- data/scenario 안의 .ks 시나리오 파일만 번역합니다 (data/system, data/others는
+  건드리지 않음). 대사, 화자 이름(#이름), 선택지([glink text=...]), 화면 문구
+  ([ptext]/[mtext]), 캐릭터 표시 이름([chara_new jname=...]) 같은 "화면에 보이는
+  값"만 바꾸고, 태그·라벨·주석·[iscript] 스크립트는 한 글자도 안 바꿉니다.
+- [l][r][p] 같은 태그와 [emb exp="f.name"] 같은 변수 자리는 번역하지 않고 지킵니다.
+  번역 결과에서 태그가 빠지면 그 줄은 원문으로 둡니다 (검토 창에서 직접 고치면 됨).
+  [ruby] 후리가나 태그는 한국어에 필요 없어서 번역된 줄에서는 뺍니다.
+- #akane 처럼 [chara_new name=...]로 등록된 캐릭터 키는 표정/이름 연결에 쓰이는
+  값이라 그대로 두고, 대신 그 캐릭터의 jname(표시 이름)을 번역합니다.
+- 출력 폴더의 _jpko_original 폴더에 원본 시나리오를 보관해 두고, 검토 창에서
+  "게임에 적용"할 때마다 원본에서 새로 만들어 씁니다.
+- 한글은 Windows 글꼴로 자동 표시되므로 폰트 교체는 하지 않습니다.
+- 한계: TyranoScript 엔진 자체의 메뉴 문구(저장/불러오기 확인창 등)와 암호화된
+  시나리오는 번역하지 않습니다.
+
 
 [주의]
 - RPG Maker는 MV/MZ만 지원합니다 (VX Ace, 2000/2003 미지원)

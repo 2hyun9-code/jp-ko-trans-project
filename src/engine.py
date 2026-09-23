@@ -1,4 +1,4 @@
-"""Game project detection (RPG Maker MV/MZ, Ren'Py) and layout helpers."""
+"""Game project detection (RPG Maker MV/MZ, TyranoScript, Ren'Py) and layout helpers."""
 from __future__ import annotations
 
 import shutil
@@ -7,6 +7,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
+import tyrano_engine
+
 
 @dataclass
 class ProjectLayout:
@@ -14,12 +16,12 @@ class ProjectLayout:
     data_dir: Optional[Path]       # folder containing Map001.json, System.json, etc.
     fonts_dir: Optional[Path]      # folder containing font files
     css_dir: Optional[Path]        # folder containing gamefont.css (MZ) if present
-    engine: str                    # "MV", "MZ", "MZ-ASAR" (packed, needs extraction first), "RENPY"
+    engine: str                    # "MV", "MZ", "ASAR" (Electron-packed, needs extraction first), "TYRANO", "RENPY"
     launch_root: Path = field(default=None)  # top-level folder holding the .exe / runtime
 
     def __post_init__(self):
         if self.launch_root is None:
-            # MZ/MZ-ASAR: the launchable folder *is* root. MV is the only
+            # MZ/ASAR: the launchable folder *is* root. MV is the only
             # case where data lives one level down (in "www"), inside a
             # folder that also holds the actual .exe + JS-engine runtime
             # (NW.js/Electron) that a copy must not lose -- detect_project
@@ -90,10 +92,19 @@ def detect_project(game_folder: str) -> ProjectLayout:
                               css_dir=css_dir, engine=engine, launch_root=launch_root)
 
     if find_app_asar(root) is not None:
-        # Packed into an Electron .asar archive -- pipeline.run_all extracts
-        # it into the copy and re-detects before doing anything else.
+        # Packed into an Electron .asar archive (RPG Maker MZ or TyranoScript)
+        # -- pipeline.run_all extracts it into the copy and re-detects before
+        # doing anything else.
         return ProjectLayout(root=root, data_dir=None, fonts_dir=None, css_dir=None,
-                              engine="MZ-ASAR", launch_root=root)
+                              engine="ASAR", launch_root=root)
+
+    tyrano = tyrano_engine.find_container(root)
+    if tyrano is not None:
+        # root: the game folder itself, or the folder holding the zip/exe
+        # the game is packed into.
+        base = tyrano.path if tyrano.kind == "dir" else tyrano.path.parent
+        return ProjectLayout(root=base, data_dir=None, fonts_dir=None, css_dir=None,
+                              engine="TYRANO", launch_root=root)
 
     renpy_root = find_renpy_root(root)
     if renpy_root is not None:
@@ -101,8 +112,8 @@ def detect_project(game_folder: str) -> ProjectLayout:
                               engine="RENPY", launch_root=renpy_root)
 
     raise ValueError(
-        "지원하는 게임 형식이 아닌 것 같습니다 (RPG Maker MV/MZ의 data/System.json이나 "
-        "Ren'Py의 game 폴더를 찾지 못했습니다). RPG Maker VX Ace, 2000/2003은 아직 "
+        "지원하는 게임 형식이 아닌 것 같습니다 (RPG Maker MV/MZ의 data/System.json, "
+        "TyranoScript의 data/scenario, Ren'Py의 game 폴더를 찾지 못했습니다). RPG Maker VX Ace, 2000/2003은 아직 "
         "지원하지 않습니다."
     )
 

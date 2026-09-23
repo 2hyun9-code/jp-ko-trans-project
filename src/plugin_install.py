@@ -36,7 +36,7 @@ _PLUGINS_ASSIGN_RE = re.compile(r"^(.*?\$plugins\s*=\s*)(\[.*\])(\s*;?\s*)$", re
 
 
 def _bundled_source(engine: str) -> Optional[Path]:
-    sub = "MV" if engine == "MV" else "MZ" if engine in ("MZ", "MZ-ASAR") else None
+    sub = "MV" if engine == "MV" else "MZ" if engine in ("MZ", "ASAR") else None
     if sub is None:
         return None
     path = _PLUGINS_SRC_DIR / sub / f"{_PLUGIN_NAME}.js"

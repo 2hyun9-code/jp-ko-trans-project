@@ -12,7 +12,7 @@ rem line at a time with no block-level pre-parsing to get confused by.
 set "MODEL_NAME=hf.co/hell0ks/ja-ko-vn-12b-v2-gguf:Q5_K_M"
 
 echo ================================================
-echo  쯔꾸르 한국어화 도구 - 처음 설치
+echo  JP-KO Trans (일본어 게임 한국어화 도구) - 처음 설치
 echo ================================================
 echo.
 echo 이 스크립트는 다음을 자동으로 확인/설치합니다:
@@ -115,7 +115,7 @@ echo [설정] 동시 번역 처리량 설정을 적용합니다...
 setx OLLAMA_NUM_PARALLEL "4" >nul
 setx OLLAMA_CONTEXT_LENGTH "4096" >nul
 
-if exist "쯔꾸르_한국어화_도구.exe" goto exe_ready
+if exist "JP-KO_Trans.exe" goto exe_ready
 
 echo.
 echo [빌드] 실행 파일이 없어 소스에서 새로 빌드합니다...
@@ -127,7 +127,7 @@ python -m pip install --user --quiet pyinstaller customtkinter fonttools brotli 
 if errorlevel 1 goto pip_failed
 
 pushd src
-pyinstaller --noconfirm --onefile --windowed --name "쯔꾸르_한국어화_도구" --collect-all customtkinter --add-data "plugins;plugins" --distpath .. gui.py
+pyinstaller --noconfirm --onefile --windowed --name "JP-KO_Trans" --collect-all customtkinter --add-data "plugins;plugins" --distpath .. gui.py
 if errorlevel 1 goto build_failed
 popd
 echo [빌드] 완료.
@@ -158,7 +158,7 @@ exit /b 1
 echo.
 echo ================================================
 echo  설치 완료!
-echo  쯔꾸르_한국어화_도구.exe 를 실행해서 사용하세요.
+echo  JP-KO_Trans.exe 를 실행해서 사용하세요.
 echo  (방금 설정한 환경변수가 확실히 반영되려면
 echo   컴퓨터를 한 번 재시작하는 것을 권장합니다)
 echo ================================================

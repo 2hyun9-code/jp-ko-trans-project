@@ -7,7 +7,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from asar_tool import extract_asar  # noqa: E402
+from asar_tool import extract_asar, read_asar_files  # noqa: E402
 
 
 def _build_fake_asar(entries: dict[str, bytes]) -> bytes:
@@ -87,3 +87,31 @@ def test_extract_asar_rejects_too_small_file(tmp_path):
     asar_path.write_bytes(b"tiny")
     with pytest.raises(ValueError):
         extract_asar(asar_path, tmp_path / "out")
+
+
+def test_unpacked_entries_come_from_the_side_folder(tmp_path):
+    data = _build_fake_asar({"a.txt": b"packed"})
+    header_len = struct.unpack_from("<I", data, 12)[0]
+    header = json.loads(data[16:16 + header_len])
+    header["files"]["native.node"] = {"size": 3, "unpacked": True}
+    body = json.dumps(header).encode("utf-8")
+    padded = body + b"\x00" * (((len(body) + 3) & ~3) - len(body))
+    rebuilt = struct.pack("<IIII", 4, 8 + len(padded), 4 + len(padded), len(body)) + padded + b"packed"
+    asar_path = tmp_path / "app.asar"
+    asar_path.write_bytes(rebuilt)
+    (tmp_path / "app.asar.unpacked").mkdir()
+    (tmp_path / "app.asar.unpacked" / "native.node").write_bytes(b"bin")
+
+    n = extract_asar(asar_path, tmp_path / "out")
+    assert n == 2
+    assert (tmp_path / "out" / "native.node").read_bytes() == b"bin"
+    assert (tmp_path / "out" / "a.txt").read_bytes() == b"packed"
+
+
+def test_entries_escaping_the_destination_are_skipped(tmp_path):
+    data = _build_fake_asar({"../evil.txt": b"x", "ok.txt": b"y"})
+    asar_path = tmp_path / "app.asar"
+    asar_path.write_bytes(data)
+    assert extract_asar(asar_path, tmp_path / "out" / "inner") == 1
+    assert not (tmp_path / "out" / "evil.txt").exists()
+    assert read_asar_files(asar_path, lambda n: True) == {"ok.txt": b"y"}
